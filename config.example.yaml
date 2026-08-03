@@ -1,0 +1,86 @@
+# ============================================================
+# feishu-assistant 主配置（示例模板）
+# 复制为 config.yaml 后填写自己的值；密钥不要写在这里！密钥放在 .env（模板见 .env.example）
+# ============================================================
+
+# ---- 大模型 provider（供给方）----
+# 每个 provider：base_url + api_key_env（指向 .env 里的变量名）+ enabled
+# 可选 protocol："openai"（默认，/chat/completions）或 "anthropic"（/messages，Claude Code 风格端点）
+# enabled: false 或缺 key 时不能被选择；若它正是当前选择，调用会直接中文报错
+# 也可以在 bot 里发「模型」，用面板卡片的「添加 provider」表单在线添加（存 data/custom_providers.json）
+providers:
+  # 免费多模型网关（默认主力）：OpenAI 协议，模型含 kimi-k3 / kimi-k3-highspeed 等
+  free-tokens:
+    base_url: "https://free-tokens.msh.team/v1"
+    api_key_env: "FREE_TOKENS_API_KEY"
+    enabled: true
+  # Kimi Code 订阅端点（Anthropic 协议，base_url 不带 /v1 会自动后补）：
+  # 当前无有效 key，默认关闭；拿到 key 后改 enabled: true
+  kimi-coding:
+    base_url: "https://api.kimi.com/coding"
+    api_key_env: "KIMI_CODING_API_KEY"
+    enabled: false
+    protocol: "anthropic"
+  # Moonshot 官方按量付费（可选）：默认关闭，充值后改 enabled: true，再在「模型」面板手动选择
+  moonshot:
+    base_url: "https://api.moonshot.cn/v1"
+    api_key_env: "MOONSHOT_API_KEY"
+    enabled: false
+
+# ---- 全局模型选择 ----
+# 兼容旧配置格式，所以保留 heavy/light 两项；两者应填写同一值，运行时只认全局选择。
+# 面板选择会同时更新两项。API 或模型失败时会通知，不会自动转移。
+routing:
+  heavy:    # 重活：论文精读、押题、复盘、复杂推理
+    - provider: "free-tokens"
+      model: "kimi-k3"
+  light:    # 轻活：打标、摘要、日报、日常闲聊
+    - provider: "free-tokens"
+      model: "kimi-k3"
+
+# ---- 大模型调用参数 ----
+kimi:
+  timeout: 120       # 秒。长输入自动流式，此值只限制相邻 chunk 的卡顿时间；不限制整次论文生成总时长
+  max_retries: 2     # 当前所选模型内的重试次数（指数退避），耗尽后通知，不切换模型
+  max_input_chars: 200000   # 追问上下文预算；V3 精读不截尾，长论文按原文块建立证据索引并逐节回源写作
+
+# ---- 会话系统上下文预算（P2b，单位：字符/token 估算值）----
+session:
+  persona_chars: 500     # 系统人设上限
+  summary_chars: 1500    # 滚动摘要上限
+  recent_rounds: 10      # 最近 N 轮原文
+  recent_tokens: 6000    # 最近原文 token 预算（超出增量压缩进摘要）
+  recall_chars: 2000     # 跨会话召回注入上限
+
+# ---- 定时推送（P4 生效：arXiv日报 8:30 / 今日提醒 9:00 / 组会周报 周一 9:00 / 每周精选 周五 20:00）----
+push:
+  daily_time: "08:30"    # arXiv 日报推送时间
+  evening_time: "22:00"  # 晚间回顾推送时间
+  chat_id: "oc_填你的会话ID"  # 定时推送目标会话（从 bot 日志的 chat= 确认）
+  # 显式兴趣声明：与论文库口味合并参与日报排序（冷启动期兜底，库大了自然过渡）
+  interests:
+    - "Agent Harness"
+    - "LLM Agent"
+    - "post-training"
+    - "RLHF"
+    - "GRPO"
+    - "DPO"
+    - "reinforcement learning"
+    - "fine-tuning"
+    - "alignment"
+    - "reasoning"
+
+# ---- 飞书多维表格 ----
+# app_token 与各表 table_id 由 feishu-assistant init 自动创建并写回，
+# 无需手工填写；如需重建，把下面的值清空后再运行一次 init。
+bitable:
+  app_token: ""
+  tables:
+    论文库: ""
+    收藏库: ""
+    灵感库: ""
+    求职看板: ""
+    面经库: ""
+    简历库: ""
+    备忘库: ""
+    精选库: ""  # init 补建追加

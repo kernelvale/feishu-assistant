@@ -1,0 +1,41 @@
+[project]
+name = "feishu-assistant"
+version = "0.1.0"
+description = "飞书个人助理 bot：Kimi 大模型 + 飞书长连接 + 多维表格数据层"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lark-oapi>=1.4.0",
+    "openai>=1.50.0",
+    "apscheduler>=3.10.4,<4.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "mineru[pipeline]>=3.4.4",
+    "pymupdf4llm>=1.28.0",
+    "httpx>=0.28.1",
+    "lxml>=5.0.0",
+    "python-docx>=1.2.0",
+    "six>=1.17.0",
+    "fastembed>=0.8.0",
+    "sqlite-vec>=0.1.9",
+    "mlx-whisper>=0.4.3",
+    "numba>=0.60",
+]
+
+[project.scripts]
+feishu-assistant = "feishu_assistant.main:cli"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/feishu_assistant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

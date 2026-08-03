@@ -1,0 +1,20 @@
+# 密钥
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# 运行产物
+logs/
+data/
+
+# macOS
+.DS_Store
+
+# 本地配置（含私有 ID，模板见 config.example.yaml）
+config.yaml
+# 个人文档（项目报告/管线规格/搭建记录，不入库）
+docs/

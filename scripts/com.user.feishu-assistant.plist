@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd 自启模板：feishu-assistant bot
+
+  安装：
+    mkdir -p /Users/admin/feishu-assistant/logs
+    cp scripts/com.user.feishu-assistant.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.user.feishu-assistant.plist
+
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.user.feishu-assistant.plist
+
+  注意：若 uv 不在 /Users/admin/.local/bin/uv（which uv 确认），请修改下面的路径。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.feishu-assistant</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/admin/.local/bin/uv</string>
+        <string>run</string>
+        <string>--directory</string>
+        <string>/Users/admin/feishu-assistant</string>
+        <string>feishu-assistant</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/admin/feishu-assistant</string>
+
+    <!-- 崩溃/退出后自动重启；登录后自动启动 -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 异常退出后 10s 再重启，避免凭证错误时疯狂刷日志 -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/admin/feishu-assistant/logs/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/admin/feishu-assistant/logs/stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/admin/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
