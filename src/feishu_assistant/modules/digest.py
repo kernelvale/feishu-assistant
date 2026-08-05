@@ -403,22 +403,6 @@ def select_top_with_quota(
     return picked
 
 
-# ---- [V7.1 清理] 已停用：生产 _taste_scorer 直接调 vector_index.search。经全项目核对生产链路零引用，保留备查 ----
-# def vector_score(entry: ArxivEntry, vector_index: Any) -> float:
-#     """与论文库最近一篇的相似度（1 - cosine 距离）；无命中/异常返回 0。
-#
-#     检索排除论文自身（exclude_arxiv_id）：已入库论文自我命中距离≈0，不算口味证据。"""
-#     try:
-#         hits = vector_index.search(entry.title, entry.abstract[:300], top_k=1,
-#                                    exclude_arxiv_id=entry.arxiv_id)
-#     except Exception as exc:
-#         logger.warning("向量打分失败（按 0 计）：%s", exc)
-#         return 0.0
-#     if not hits:
-#         return 0.0
-#     return max(0.0, 1.0 - float(hits[0][2]))
-
-
 def rank_entries(
     entries: list[ArxivEntry], scorer: Callable[[ArxivEntry], float]
 ) -> list[tuple[ArxivEntry, float]]:

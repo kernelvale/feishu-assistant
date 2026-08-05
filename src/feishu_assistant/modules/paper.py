@@ -59,7 +59,7 @@ from ..feishu.bitable import (
 )
 from ..feishu.docx import DocxClient, DocxError, fit_image_size, image_dimensions  # noqa: F401  (fit/image 尺寸助手经本模块 re-export)
 from ..feishu.drive import DriveClient, DriveError
-from ..kimi import KimiClient, KimiError
+from ..kimi import KimiClient, KimiError, get_llm_stats
 from ..lifecycle import LifecycleError, PaperCache, PaperCacheEntry
 from ..pdf import PdfParseError, parse_pdf, pdf_page_count
 from ..store import (
@@ -73,8 +73,9 @@ from ..vectors import PaperVectorIndex
 from .figures import FigureAsset, load_figure_assets
 from .formulas import load_formula_assets
 from .reading import ReadingEngine, ReadingError, ReadingResult, classify_direction
+from .reading_v9 import V9ReadingEngine
 from .reading_workflow import ReadingWorkspace
-from .status import StatusMessenger
+from .status import StatusMessenger, TaskCard
 
 logger = logging.getLogger("feishu_assistant.paper")
 
@@ -414,6 +415,21 @@ def _md_element(content: str) -> dict:
     return {"tag": "markdown", "content": content}
 
 
+_V9_RELEASE_LABELS = {
+    "verified_final": "两项审查完成；自动改动仅采用已验证补丁",
+    "fact_review_unavailable": "事实审查未完成",
+    "reader_review_unavailable": "真实读者审查未完成",
+    "revision_rolled_back": "自动修订已回滚，发布作者初稿",
+    "draft_rejected": "核心事实问题尚未解决，仅发布草稿",
+    "author_draft": "当前为作者初稿",
+}
+
+
+def _release_label(metadata: dict[str, Any]) -> str:
+    status = str(metadata.get("release_status") or "").strip()
+    return _V9_RELEASE_LABELS.get(status, status or "精读文档已生成")
+
+
 def build_result_card(
     metadata: dict[str, Any],
     doc_url: str,
@@ -433,6 +449,12 @@ def build_result_card(
     elements = [
         _md_element(f"**TL;DR**\n{tldr}"),
     ]
+    release_status = str(metadata.get("release_status") or "").strip()
+    if release_status in _V9_RELEASE_LABELS and release_status != "verified_final":
+        elements.append(_md_element(
+            f"⚠️ **V9 发布状态：{_V9_RELEASE_LABELS[release_status]}**\n"
+            "系统没有合成终审通过；详情见文档顶部与产物记录。"
+        ))
     final_degraded = str(metadata.get("final_review_degraded") or "").strip()
     degraded_sections = metadata.get("degraded_sections") or []
     if final_degraded or degraded_sections:
@@ -465,8 +487,13 @@ def build_result_card(
                 "type": "primary",
             }],
         })
-    degraded = bool(metadata.get("final_review_degraded") or metadata.get("degraded_sections"))
-    core_failed = bool(metadata.get("final_review_core_failed"))
+    degraded = bool(
+        metadata.get("final_review_degraded") or metadata.get("degraded_sections")
+        or (release_status and release_status != "verified_final")
+    )
+    core_failed = bool(
+        metadata.get("final_review_core_failed") or release_status == "draft_rejected"
+    )
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -586,7 +613,7 @@ class PaperReadingService:
         sender: Sender,
         max_input_chars: int = DEFAULT_MAX_INPUT_CHARS,
         vector_index: PaperVectorIndex | None = None,
-        reading_engine: ReadingEngine | None = None,
+        reading_engine: ReadingEngine | V9ReadingEngine | None = None,
         paper_cache: PaperCache | None = None,
         task_store: ReadingTaskStore | None = None,
         outbox: NotificationOutbox | None = None,
@@ -600,7 +627,9 @@ class PaperReadingService:
         self.docx = DocxClient(lark_client)
         self.drive = DriveClient(lark_client)
         self.vector_index = vector_index
-        self.reading_engine = reading_engine or ReadingEngine(kimi)
+        # 正式生产默认走 V9 叙事优先管线；历史 ReadingEngine(V8) 继续保留给
+        # 显式注入、取证对比和回归测试，不再作为默认内容内核。
+        self.reading_engine = reading_engine or V9ReadingEngine(kimi)
         self.paper_cache = paper_cache or PaperCache(PAPERS_DIR, store=store)
         # 精读任务登记（断线/重启恢复）：默认与 PaperStore 共用同一库文件
         self.task_store = task_store or ReadingTaskStore(store.db_path)
@@ -759,9 +788,20 @@ class PaperReadingService:
                 )
             except Exception:
                 logger.exception("精读任务登记失败（不影响本次运行）：%s", dedup_key)
-        status = StatusMessenger(
+        v9_progress = isinstance(self.reading_engine, V9ReadingEngine)
+        stages = (
+            ["解析 PDF", "来源导航", "叙事简报", "连续正文", "专项审查", "有限修订", "定点验证", "发布归档"]
+            if v9_progress else
+            ["解析 PDF", "证据索引", "规划（债务+Plan）", "正文生成", "图表讲解", "终审", "发布归档"]
+        )
+        # LLM 统计是进程级累计（跨任务）：记任务基线，进度卡统计行展示本任务增量
+        stats0 = get_llm_stats()
+        status = TaskCard(
             self.sender, context.chat_id, f"精读 {label}",
+            stages=stages,
             alert_fn=self._stuck_alert_fn(context.chat_id, label),
+            calls_fn=lambda: get_llm_stats()["calls"] - stats0["calls"],
+            cached_fn=lambda: get_llm_stats()["cached_tokens"] - stats0["cached_tokens"],
         ).start()
         context.status = status  # 按消息绑定：两篇精读并发，阶段行各进各的状态条
         thread = threading.Thread(
@@ -812,7 +852,7 @@ class PaperReadingService:
         return _alert
 
     def _run_with_transient_retry(self, context: MessageContext, label: str, job,
-                                  kwargs: dict, status: StatusMessenger):
+                                  kwargs: dict, status: "StatusMessenger | TaskCard"):
         """跑 job；瞬时网络故障按 TRANSIENT_RETRY_BACKOFFS 退避自动重跑，耗尽后原样抛出。
 
         只有 _is_transient_error 命中的网络/超时/DNS 类错误才重跑——非瞬时错误
@@ -849,7 +889,7 @@ class PaperReadingService:
                 time.sleep(delay)
 
     def _run_guarded(self, context: MessageContext, label: str, job, kwargs: dict,
-                     status: StatusMessenger, dedup_key: str = "") -> None:
+                     status: "StatusMessenger | TaskCard", dedup_key: str = "") -> None:
         """后台线程本体：瞬时故障重试 → 成功推结果卡 / 失败推错误卡 → 回写任务登记。
         失败除错误卡外另经外发箱补一条必达文本（断网时错误卡会丢，文本补发不丢）。"""
         try:
@@ -871,7 +911,17 @@ class PaperReadingService:
             return
         finally:
             self._release_inflight(dedup_key)
-        status.stop(ok=True, note=f"精读完成，文档与详情见下方结果卡")
+        release_status = str(metadata.get("release_status") or "").strip()
+        status_note = (
+            "精读完成，两项审查已完成；自动改动仅采用已验证补丁"
+            if release_status == "verified_final"
+            else f"精读完成，发布状态：{_release_label(metadata)}"
+            if release_status else
+            "精读完成，文档与详情见下方结果卡"
+        )
+        # 任务执行已完成不等于质量审查通过；状态条明确展示 V9 release_status，
+        # 但任务登记仍记 done，避免已交付草稿被重启恢复反复生成。
+        status.stop(ok=True, note=status_note)
         arxiv_id = kwargs.get("arxiv_id", "")
         self.sender.send_card(
             context.chat_id,
@@ -1060,12 +1110,16 @@ class PaperReadingService:
     # -- 公共精读管线 --
 
     def _progress(self, context: MessageContext, text: str, *, persist: bool = False) -> None:
-        """阶段切换：默认只更新状态条阶段行（不刷屏）；persist=True 才发真实消息
-        （仅文档链接这类需要留存的信息）。发送失败仅记日志（不打断管线）。"""
+        """阶段切换：默认只更新状态条/进度卡（不刷屏）；persist=True 才发真实消息
+        （仅文档链接这类需要留存的信息）。发送失败仅记日志（不打断管线）。
+        TaskCard 走文本→TODO 阶段映射（展示层）；旧 StatusMessenger 维持原文案。"""
         logger.info("进度：%s", text)
         status = getattr(context, "status", None)
         if status is not None:
-            status.set_stage(text)
+            if isinstance(status, TaskCard):
+                status.apply_progress(text)
+            else:
+                status.set_stage(text)
         if persist:
             try:
                 self.sender.send_text(context.chat_id, text)
@@ -1084,7 +1138,7 @@ class PaperReadingService:
         cache_entry: PaperCacheEntry | None = None,
         dedup_key: str = "",
     ) -> tuple[dict, str, bool]:
-        """解析 → 教学精读 → 整篇终审 → 一次性写文档 → 归档 → 落库 → 向量。
+        """解析 → V9 连续成稿 → 两次专项审查 → 有限补丁/定点验证 → 发布 → 归档。
         dedup_key：无 arXiv ID 的链接论文的查重键（归一化链接），版本演进与归档查重用。"""
         t_start = time.time()
         with track("MinerU 解析 PDF"):
@@ -1103,8 +1157,12 @@ class PaperReadingService:
         self._progress(
             context,
             f"✅ 解析完成（{pages or '?'} 页，{len(figures)} 张图表，{len(formulas)} 个公式，"
-            f"{time.time() - t_start:.0f}s）。"
-            "开始精读生成：骨架、分层精讲、逐图解释完成后会整篇终审，通过后再写入文档。",
+            f"{time.time() - t_start:.0f}s）。" + (
+                "开始 V9 精读：单一作者连续成稿，随后做一次事实审查、一次真实读者审查；"
+                "只有经过定点验证的修改才会进入最终文档。"
+                if isinstance(self.reading_engine, V9ReadingEngine)
+                else "开始历史精读管线；结果会按旧版兼容协议发布。"
+            ),
         )
 
         images = {asset.label: asset.img_path for asset in figures}
@@ -1117,9 +1175,12 @@ class PaperReadingService:
             "meta_hint": meta_hint,
             "progress": lambda s: self._progress(context, s),
         }
-        if cache_entry is not None and isinstance(self.reading_engine, ReadingEngine):
+        workspace_version = str(getattr(self.reading_engine, "workspace_version", "") or "")
+        if cache_entry is not None and workspace_version:
             # 检查点和 PDF 共用内容寻址对象目录；进程退出后租约自动释放，复读可续跑。
-            workspace = ReadingWorkspace(cache_entry.object_dir)
+            workspace = ReadingWorkspace(
+                cache_entry.object_dir, pipeline_version=workspace_version,
+            )
             with workspace.lease():
                 reading = self.reading_engine.run(
                     paper_md, figures, formulas, workspace=workspace, **reading_kwargs,
@@ -1133,9 +1194,18 @@ class PaperReadingService:
         metadata = reading.metadata
         metadata["_version"] = version
         title = metadata.get("title_zh") or metadata.get("title_en") or key
+        classifier = self.kimi
+        classifier_factory = getattr(self.reading_engine, "classification_client", None)
+        if callable(classifier_factory):
+            classifier = classifier_factory()
         metadata["direction"] = classify_direction(
-            self.kimi, title, str(metadata.get("tldr", ""))
+            classifier, title, str(metadata.get("tldr", ""))
         )
+        # 方向分类是精读任务的真实模型调用，计入结果卡成本；V9 复用任务启动时
+        # 已冻结的 reviewer 路由，避免正文完成后热切换到另一模型。
+        if isinstance(self.reading_engine, V9ReadingEngine):
+            reading.model_calls += 1
+            metadata["model_calls"] = reading.model_calls
         logger.info("方向分类：%s → %s", title, metadata["direction"])
         images.update(reading.formula_images)
 
@@ -1177,16 +1247,40 @@ class PaperReadingService:
 
         with track("归档多维表格"):
             archived = self._archive(metadata, doc_url, pdf_url, arxiv_id, dedup_key)
-        self.store.save_paper(
-            context.chat_id, arxiv_id or key, title,
-            paper_md, doc_url=doc_url, pdf_path=str(pdf_path),
-        )
-        if self.vector_index is not None and arxiv_id:
-            self.vector_index.add_paper(
-                arxiv_id, title,
-                str(metadata.get("tldr", "")), metadata.get("keywords") or [],
+        # 产出优先（第 8 步收口）：正文已发布即是成功——落库/向量入库是可独立降级的
+        # 附属产物，失败只警告+通知，绝不把已交付论文标成任务失败
+        try:
+            self.store.save_paper(
+                context.chat_id, arxiv_id or key, title,
+                paper_md, doc_url=doc_url, pdf_path=str(pdf_path),
             )
-        self._progress(context, f"📄 精读文档已通过终审并写入：{doc_url}", persist=True)
+        except Exception as exc:
+            logger.exception("sqlite 落库失败（不影响已交付正文）：%s", exc)
+            metadata["store_failed"] = str(exc)[:200]
+            self._progress(
+                context, "⚠️ 本地落库失败（精读文档已交付，可正常阅读）", persist=True)
+        if self.vector_index is not None and arxiv_id:
+            try:
+                self.vector_index.add_paper(
+                    arxiv_id, title,
+                    str(metadata.get("tldr", "")), metadata.get("keywords") or [],
+                )
+            except Exception as exc:
+                logger.exception("向量入库失败（不影响已交付正文）：%s", exc)
+                metadata["vector_failed"] = str(exc)[:200]
+                self._progress(
+                    context,
+                    "⚠️ 向量入库失败（精读文档已交付，可正常阅读；追问检索可能缺少本篇）",
+                    persist=True,
+                )
+        release_status = str(metadata.get("release_status") or "").strip()
+        if release_status == "verified_final":
+            completion = "📄 V9 精读文档已完成两项审查（自动改动仅采用已验证补丁）并写入"
+        elif release_status:
+            completion = f"📄 精读文档已写入（V9 状态：{_release_label(metadata)}）"
+        else:
+            completion = "📄 精读文档已生成并写入"
+        self._progress(context, f"{completion}：{doc_url}", persist=True)
 
         # 计时埋点：写日志并随完成卡展示（回应速度质疑用）
         metadata["_timing"] = self._timing_text(reading, t_start, t_doc, time.time())
@@ -1198,15 +1292,30 @@ class PaperReadingService:
         timer = reading.timer
         parts = []
         if timer is not None:
-            parts.append(f"骨架 {timer.elapsed('骨架'):.0f}s")
-            layer_marks = [n for n, _ in timer.marks if n.startswith("层")]
-            if layer_marks:
-                layers_secs = "、".join(f"层{i + 1} {timer.elapsed(n):.0f}s"
-                                       for i, n in enumerate(layer_marks))
-                parts.append(
-                    f"精讲 {timer.duration('精讲开始', '精讲'):.0f}s（{layers_secs}）"
+            mark_names = {name for name, _ in timer.marks}
+            if "evidence" in mark_names:
+                v9_stages = (
+                    ("来源", "evidence"),
+                    ("简报", "brief"),
+                    ("初稿", "author-draft"),
+                    ("两审", "audits"),
+                    ("修订", "revision"),
+                    ("验证", "verification"),
                 )
-            parts.append(f"图表 {timer.elapsed('图表'):.0f}s")
+                parts.extend(
+                    f"{label} {timer.elapsed(mark):.0f}s"
+                    for label, mark in v9_stages if mark in mark_names
+                )
+            else:
+                parts.append(f"骨架 {timer.elapsed('骨架'):.0f}s")
+                layer_marks = [n for n, _ in timer.marks if n.startswith("层")]
+                if layer_marks:
+                    layers_secs = "、".join(f"层{i + 1} {timer.elapsed(n):.0f}s"
+                                           for i, n in enumerate(layer_marks))
+                    parts.append(
+                        f"精讲 {timer.duration('精讲开始', '精讲'):.0f}s（{layers_secs}）"
+                    )
+                parts.append(f"图表 {timer.elapsed('图表'):.0f}s")
         parts.append(f"文档 {t_end - t_doc:.0f}s")
         parts.append(f"全程 {t_end - t_start:.0f}s")
         parts.append(f"模型调用 {reading.model_calls} 次")

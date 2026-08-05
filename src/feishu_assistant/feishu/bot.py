@@ -179,34 +179,6 @@ def md_for_card(markdown: str) -> str:
     return "\n".join(out)
 
 
-# ---- [V7.1 清理] 已停用：V2 时代 post 富文本切分，现全走卡片/markdown。经全项目核对生产链路零引用，保留备查 ----
-# def _post_bold_elements(text: str) -> list[dict]:
-#     """**bold** 切分为 text 段（post 内联元素）。"""
-#     out: list[dict] = []
-#     for i, part in enumerate(re.split(r"\*\*(.+?)\*\*", text)):
-#         if not part:
-#             continue
-#         if i % 2 == 1:
-#             out.append({"tag": "text", "text": part, "style": ["bold"]})
-#         else:
-#             out.append({"tag": "text", "text": part})
-#     return out
-#
-#
-# def _post_inline_elements(text: str) -> list[dict]:
-#     """一行 → post 内联元素序列（链接 [t](url) 与 **加粗**）。"""
-#     elements: list[dict] = []
-#     pos = 0
-#     for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", text):
-#         if m.start() > pos:
-#             elements.extend(_post_bold_elements(text[pos:m.start()]))
-#         elements.append({"tag": "a", "text": m.group(1), "href": m.group(2)})
-#         pos = m.end()
-#     if pos < len(text):
-#         elements.extend(_post_bold_elements(text[pos:]))
-#     return elements or [{"tag": "text", "text": " "}]
-
-
 class FeishuBot:
     """事件分发 + 文本/文件消息收发 + 主动推送。所有用户可见文案均为中文。"""
 
@@ -682,6 +654,38 @@ class FeishuBot:
             return ""
         return f"{card_id}|{element_id}"
 
+    def rich_card_create(self, chat_id: str, card_json: dict) -> str:
+        """发送完整结构的流式卡片（header/多元素，streaming+update_multi 持续更新）。
+        返回 card_id（失败 ""）；元素级更新走 status_card_update("card_id|element_id", text)。"""
+        from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+
+        card_json = dict(card_json)
+        config = dict(card_json.get("config") or {})
+        config.update({"streaming_mode": True, "update_multi": True})
+        card_json["config"] = config
+        card_json.setdefault("schema", "2.0")
+        body = (CreateCardRequestBody.builder().type("card_json")
+                .data(json.dumps(card_json, ensure_ascii=False)).build())
+        try:
+            resp = self.client.cardkit.v1.card.create(
+                CreateCardRequest.builder().request_body(body).build())
+        except Exception:
+            logger.exception("创建富文本流式卡传输失败")
+            return ""
+        if not resp.success():
+            logger.error(
+                "创建富文本流式卡失败：code=%s, msg=%s, log_id=%s",
+                resp.code, resp.msg, resp.get_log_id())
+            return ""
+        card_id = str(resp.data.card_id or "")
+        if not card_id:
+            return ""
+        if not self._send(chat_id, "interactive",
+                          {"type": "card", "data": {"card_id": card_id}}, "任务卡"):
+            logger.error("任务卡消息发送失败：card_id=%s", card_id)
+            return ""
+        return card_id
+
     def _discard_orphan_card(self, card_id: str, element_id: str) -> None:
         """发送失败的卡片实体就地废弃：平台没有删除卡片实体的 API（CardKit 仅支持
         删组件），写墓碑内容（万一浮出可见）+ 释放本地流式序号，card_id 留日志供排查。"""
@@ -723,6 +727,42 @@ class FeishuBot:
             )
             return str(resp.code)
         return ""
+
+    def status_card_reactivate(self, handle: str) -> bool:
+        """重新激活流式卡的 streaming_mode：平台在最后一次激活 ~10 分钟后（滑动）
+        自动关闭流式窗口，关闭前调本方法给同一张卡续命，可继续流式更新。
+        成功 True；传输异常/API 失败 False 记日志（调用方下帧重试）。
+        序号与内容更新共用同一计数：重激活后 seq 继续单调递增（不重置）。"""
+        import uuid as _uuid
+        from lark_oapi.api.cardkit.v1 import (
+            SettingsCardRequest, SettingsCardRequestBody,
+        )
+
+        card_id, _, _ = handle.partition("|")
+        if not card_id:
+            return False
+        seqs, lock = self._card_seq_state()
+        with lock:  # 与内容更新同一序号空间、锁内分配：settings 与 content 不撞号
+            seqs[card_id] = seqs.get(card_id, 0) + 1
+            seq = seqs[card_id]
+        body = (SettingsCardRequestBody.builder()
+                .settings(json.dumps({"config": {"streaming_mode": True}},
+                                     ensure_ascii=False))
+                .sequence(seq).uuid(str(_uuid.uuid4())).build())
+        req = (SettingsCardRequest.builder()
+               .card_id(card_id).request_body(body).build())
+        try:
+            resp = self.client.cardkit.v1.card.settings(req)
+        except Exception:  # 传输层异常与 API 错误码同等对待：返回 False 让调用方重试
+            logger.exception("重激活状态卡传输失败：card_id=%s", card_id)
+            return False
+        if not resp.success():
+            logger.warning(
+                "重激活状态卡失败：code=%s, msg=%s, log_id=%s",
+                resp.code, resp.msg, resp.get_log_id()
+            )
+            return False
+        return True
 
     def status_card_close(self, handle: str) -> None:
         """状态卡句柄终结：清理按 card_id 累积的流式序号（status.stop 调用，防只增不清的泄漏）。"""
@@ -780,21 +820,6 @@ class FeishuBot:
 
     def send_card(self, chat_id: str, card: dict) -> bool:
         return self._send(chat_id, "interactive", card, "卡片")
-
-    # ---- [V7.1 清理] 已停用：V2 旧卡片口，现全走卡片/markdown 新路径。经全项目核对生产链路零引用，保留备查 ----
-    # def send_md_card(self, chat_id: str, title: str, markdown: str) -> bool:
-    #     """以卡片推送 markdown 内容（飞书卡片不渲染 ## 标题与管道表格，先预处理）。"""
-    #     body = md_for_card(markdown)
-    #     elements: list[dict] = [{"tag": "markdown", "content": body}]
-    #     card = {
-    #         "config": {"wide_screen_mode": True},
-    #         "header": {
-    #             "template": "blue",
-    #             "title": {"tag": "plain_text", "content": title},
-    #         },
-    #         "elements": elements,
-    #     }
-    #     return self.send_card(chat_id, card)
 
     # ---- 启动 ----
 

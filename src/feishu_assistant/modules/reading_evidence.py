@@ -114,6 +114,30 @@ class EvidenceCard:
         )
 
 
+@dataclass(frozen=True)
+class SourcePacket:
+    """原文包及其覆盖情况。
+
+    ``source_packet`` 过去只返回字符串，调用方无法知道关键词召回或字符预算
+    是否把原文静默截掉。V9 只把这个结构化信息用于发布护栏；旧 V4/V8
+    调用仍可继续使用字符串接口。
+    """
+
+    text: str
+    requested_ids: tuple[str, ...] = ()
+    selected_ids: tuple[str, ...] = ()
+    candidate_ids: tuple[str, ...] = ()
+    omitted_ids: tuple[str, ...] = ()
+    truncated_ids: tuple[str, ...] = ()
+    used_fallback: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.selected_ids) and not (
+            self.omitted_ids or self.truncated_ids or self.used_fallback
+        )
+
+
 @dataclass
 class EvidenceBundle:
     chunks: list[SourceChunk]
@@ -140,13 +164,20 @@ class EvidenceBundle:
             )
         return text
 
-    def source_packet(
+    def source_packet_info(
         self,
         refs: list[str] | None,
         hints: list[str] | None = None,
         max_chars: int = SOURCE_PACKET_CHARS,
-    ) -> str:
-        """优先按计划的精确引用取原文；无引用时用标题/正文关键词保守召回。"""
+    ) -> SourcePacket:
+        """装载原文并显式报告是否发生召回降级、块省略或块内截断。
+
+        精确 source ref 仍然是首选；无 ref 或无法由上层解析时才做关键词召回。
+        关键词召回和任何预算截断都被视为 ``complete=False``，避免长论文在
+        依据不完整时被误标成已验证终稿。
+        """
+        if type(max_chars) is not int or max_chars <= 0:
+            raise ValueError("max_chars 必须是正整数")
         refs = list(dict.fromkeys(
             str(v).strip() for v in (refs or []) if str(v).strip()
         ))
@@ -158,14 +189,17 @@ class EvidenceBundle:
             raise EvidenceError("教学计划引用了不存在的原文块：" + "、".join(missing))
         if strict_refs and selected:
             # 大章切片会把一段技术论述撕进多个「片段 N」块；计划只点其中一个时，
-            # 把同基名的亲属片段一并打包（按原文顺序），避免写手拿到半截论述。
+            # 把同基名的亲属片段一并打包，避免写手拿到半截论述。
             bases = {_chunk_base_title(chunk.title) for chunk in selected}
             expanded = [chunk for chunk in self.chunks
                         if _chunk_base_title(chunk.title) in bases]
             if len(expanded) > len(selected):
                 logger.info("引用片段自动并入亲属块：%d → %d", len(selected), len(expanded))
             selected = expanded
+
+        used_fallback = False
         if not selected:
+            used_fallback = True
             terms = {
                 term.casefold()
                 for hint in (hints or [])
@@ -174,32 +208,68 @@ class EvidenceBundle:
             ranked: list[tuple[int, int, SourceChunk]] = []
             for chunk in self.chunks:
                 haystack = f"{chunk.title}\n{chunk.text}".casefold()
-                score = sum(3 if term in chunk.title.casefold() else 1 for term in terms if term in haystack)
+                score = sum(3 if term in chunk.title.casefold() else 1
+                            for term in terms if term in haystack)
                 ranked.append((score, -chunk.order, chunk))
             selected = [item[2] for item in sorted(ranked, reverse=True) if item[0] > 0]
         if not selected:
+            used_fallback = True
             selected = self.chunks[:1]
-        if strict_refs:
-            required = sum(
-                len(chunk.text) + len(chunk.title) + len(chunk.chunk_id) + 24
-                for chunk in selected
-            )
-            if required > max_chars:
-                raise EvidenceError(
-                    f"一次写作引用的原文块过多（约 {required} 字符，单包上限 {max_chars}）；"
-                    "应把章节或教学层拆细，不能静默截掉后面的引用"
-                )
+
+        requested_ids = tuple(refs)
+        candidate_ids = tuple(chunk.chunk_id for chunk in sorted(selected, key=lambda item: item.order))
+        omitted_ids: list[str] = []
+        truncated_ids: list[str] = []
+        included_ids: list[str] = []
         parts: list[str] = []
         used = 0
         for chunk in sorted(selected, key=lambda item: item.order):
             header = f"\n\n--- SOURCE {chunk.chunk_id} · {chunk.title} ---\n"
             remaining = max_chars - used - len(header)
             if remaining <= 0:
-                break
-            body = chunk.text[:remaining]
-            parts.append(header + body)
-            used += len(header) + len(body)
-        return "".join(parts).strip()
+                omitted_ids.append(chunk.chunk_id)
+                continue
+            if remaining < len(chunk.text):
+                # 首块即使超预算也保留可见前缀，但必须显式标记为截断；
+                # 后续块则整体省略，避免把半截块伪装成完整证据。
+                if not parts:
+                    parts.append(header + chunk.text[:remaining])
+                    used += len(header) + remaining
+                    truncated_ids.append(chunk.chunk_id)
+                    included_ids.append(chunk.chunk_id)
+                else:
+                    omitted_ids.append(chunk.chunk_id)
+                continue
+            parts.append(header + chunk.text)
+            used += len(header) + len(chunk.text)
+            included_ids.append(chunk.chunk_id)
+
+        packet = "".join(parts).strip()
+        if omitted_ids:
+            packet += ("\n\n（注：本单元计划引用的部分原文块因单包容量限制未装入："
+                       + "、".join(omitted_ids)
+                       + "；相关事实缺失时不得补写或推断。）")
+        if truncated_ids:
+            packet += ("\n\n（注：原文块 " + "、".join(truncated_ids)
+                       + " 只装入了前缀；来源覆盖不完整，不得据此断言未出现的细节。）")
+        return SourcePacket(
+            text=packet,
+            requested_ids=requested_ids,
+            selected_ids=tuple(included_ids),
+            candidate_ids=candidate_ids,
+            omitted_ids=tuple(omitted_ids),
+            truncated_ids=tuple(truncated_ids),
+            used_fallback=used_fallback,
+        )
+
+    def source_packet(
+        self,
+        refs: list[str] | None,
+        hints: list[str] | None = None,
+        max_chars: int = SOURCE_PACKET_CHARS,
+    ) -> str:
+        """兼容旧调用的字符串接口；V9 使用 ``source_packet_info`` 获取覆盖状态。"""
+        return self.source_packet_info(refs, hints=hints, max_chars=max_chars).text
 
     def review_material(self) -> str:
         """全局审核使用可追溯证据索引；逐章事实审核使用 source_packet 原文。"""

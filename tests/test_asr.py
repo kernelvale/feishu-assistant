@@ -6,8 +6,6 @@ import sys
 
 import pytest
 
-# ---- [V7.1 清理] 已停用：对应生产代码 is_audio_file 已停用。经全项目核对生产链路零引用，保留备查 ----
-# from feishu_assistant.asr import ASRError, is_audio_file, transcribe
 from feishu_assistant.asr import ASRError, transcribe
 
 
@@ -69,14 +67,3 @@ def test_default_transcriber_without_mlx_gives_install_hint(tmp_path, monkeypatc
     monkeypatch.setitem(sys.modules, "mlx_whisper", None)  # import 即 ImportError
     with pytest.raises(ASRError, match="uv add mlx-whisper"):
         transcribe(audio)  # 不传 transcriber → 走默认惰性导入路径
-
-
-# ---- [V7.1 清理] 已停用：对应生产代码 is_audio_file 已停用。经全项目核对生产链路零引用，保留备查 ----
-# @pytest.mark.parametrize("name", ["a.opus", "b.MP3", "c.m4a", "d.wav", "e.aac"])
-# def test_is_audio_file_hit(name):
-#     assert is_audio_file(name)
-#
-#
-# @pytest.mark.parametrize("name", ["a.pdf", "b.txt", "c", "d.opus.pdf"])
-# def test_is_audio_file_miss(name):
-#     assert not is_audio_file(name)

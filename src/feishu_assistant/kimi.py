@@ -98,8 +98,21 @@ def _strip_cache_break(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+# ---- 进程级 LLM 调用统计（任务进度卡统计行数据源；线程安全，跨任务累计）----
+_STATS_LOCK = threading.Lock()
+_LLM_STATS = {"calls": 0, "cached_tokens": 0, "out_tokens": 0}
+
+
+def get_llm_stats() -> dict[str, int]:
+    """进程级累计快照：calls（成功调用数）/ cached_tokens（前缀缓存命中）/ out_tokens。
+    调用方（paper）在任务开始时记基线、展示增量，避免多篇任务数字混淆。"""
+    with _STATS_LOCK:
+        return dict(_LLM_STATS)
+
+
 def _log_token_usage(usage: Any) -> None:
-    """把 Anthropic/OpenAI 两种 usage 形态统一落一行日志，供缓存改造前后对比。"""
+    """把 Anthropic/OpenAI 两种 usage 形态统一落一行日志，供缓存改造前后对比。
+    同点累加进程级统计（None 按 0 计）：任务进度卡「调用 N 次 · 缓存 X.Xk」。"""
     if usage is None:
         return
     if isinstance(usage, dict):
@@ -116,6 +129,10 @@ def _log_token_usage(usage: Any) -> None:
                   else getattr(details, "cached_tokens", None))
     if inp is None and out is None and cached is None:
         return
+    with _STATS_LOCK:
+        _LLM_STATS["calls"] += 1
+        _LLM_STATS["cached_tokens"] += int(cached or 0)
+        _LLM_STATS["out_tokens"] += int(out or 0)
     logger.info("tokens: in=%s cached=%s out=%s", inp, cached or 0, out)
 
 
@@ -562,11 +579,6 @@ class KimiClient:
             reviewer=FrozenKimiClient(self, active, active),
             vision=FrozenKimiClient(self, active, active),
         )
-
-    # ---- [V7.1 清理] 已停用：生产无调用（heavy 判定已内联在 chat/session 模块）。经全项目核对生产链路零引用，保留备查 ----
-    # def chat_auto(self, messages: list[dict[str, str]], user_text: str) -> str:
-    #     """按 user_text 选择流式或非流式调用；始终使用同一全局模型。"""
-    #     return self.chat(messages, heavy=is_heavy_task(user_text))
 
     def chat_json(self, messages: list[dict[str, str]], *, heavy: bool = True) -> dict:
         """JSON 模式对话，返回解析后的 dict；解析失败抛 KimiError。"""

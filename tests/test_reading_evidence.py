@@ -49,14 +49,26 @@ def test_split_source_preserves_tail_without_truncation():
     assert chunks[-1].text.endswith("尾部证据")
 
 
-def test_exact_source_refs_fail_instead_of_silently_dropping_later_chunks():
+def test_exact_source_refs_over_budget_packed_transparently_not_killed():
+    """第 8 步收口：strict refs 超预算不再判死——按块预算装包（首块必装），
+    装不下的块在包尾透明标注（不静默截掉）。"""
     chunks = [
         SourceChunk("chunk-0001", "A", "甲" * 40, 1),
         SourceChunk("chunk-0002", "B", "乙" * 40, 2),
     ]
     bundle = EvidenceBundle(chunks, [EvidenceCard("chunk-0001", "A")], True)
-    with pytest.raises(EvidenceError, match="不能静默截掉"):
-        bundle.source_packet(["chunk-0001", "chunk-0002"], max_chars=60)
+    packet = bundle.source_packet(["chunk-0001", "chunk-0002"], max_chars=60)
+    assert "SOURCE chunk-0001" in packet          # 首块必装（按预算截断内容）
+    assert "SOURCE chunk-0002" not in packet      # 装不下的块让位
+    assert "chunk-0002" in packet                 # 但未装入本身透明标注
+    assert "单包容量限制未装入" in packet
+
+
+def test_missing_source_refs_still_fail_closed():
+    chunks = [SourceChunk("chunk-0001", "A", "甲" * 10, 1)]
+    bundle = EvidenceBundle(chunks, [EvidenceCard("chunk-0001", "A")], True)
+    with pytest.raises(EvidenceError, match="不存在的原文块"):
+        bundle.source_packet(["chunk-0001", "chunk-9999"])
 
 
 def test_duplicate_exact_refs_are_deduplicated_without_false_missing_error():
@@ -74,6 +86,21 @@ def test_hint_recall_scans_the_whole_chunk_not_only_first_8000_chars():
     packet = bundle.source_packet([], ["late-needle"])
     assert "SOURCE chunk-0002" in packet and "late-needle" in packet
     assert "SOURCE chunk-0001" not in packet
+
+
+def test_source_packet_info_marks_fallback_and_budget_truncation():
+    bundle = EvidenceBundle([
+        SourceChunk("chunk-0001", "目标", "甲" * 80, 1),
+        SourceChunk("chunk-0002", "后续", "乙" * 80, 2),
+    ], [], True)
+
+    fallback = bundle.source_packet_info([], ["目标"], max_chars=200)
+    assert fallback.used_fallback is True
+    assert fallback.complete is False
+
+    exact = bundle.source_packet_info(["chunk-0001", "chunk-0002"], max_chars=60)
+    assert exact.omitted_ids or exact.truncated_ids
+    assert exact.complete is False
 
 
 def test_code_fence_headings_do_not_split_source():

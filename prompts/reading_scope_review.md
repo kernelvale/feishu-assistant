@@ -17,10 +17,19 @@
 
 以下都不算越界：普通提及、必要回指、引用已建立概念、用自己的话交代背景。
 
-命中任何一种形态时，problem 文本必须以「结构重复：」开头。
+命中任何一种形态时，problem 文本必须以「结构重复：」开头，并尽量给出定位字段
+（没有把握就留空数组，**不得编造 ID**）：
+
+- `root_scope=plan` + `debt_ids`：归属图显示同一债务〔debt-xxx〕被**两个单元
+  共同承担**（合同分配导致重复）；或两条债务语义实同（kind=debt_duplicated）。
+- `root_scope=body` + `body_block_ids`：归属图显示该债务**只有一个属主单元**，
+  是本章越界搬入；正文中的 `<!-- block:xxx#bNN -->` 是程序注入的定位标记，
+  引用块 ID 时填入 body_block_ids。
 
 ```json
-{"pass": true, "issues": [{"problem": "结构重复：具体表现（哪个单元的内容被搬入/复述）"}]}
+{"pass": true, "issues": [{"kind": "structural_duplication", "root_scope": "body",
+  "problem": "结构重复：具体表现（哪个单元的内容被搬入/复述）",
+  "debt_ids": [], "body_block_ids": []}]}
 ```
 
 ## 本章建立义务
@@ -32,5 +41,7 @@
 {{FULL_MAP}}
 
 ## 待审核正文
+
+（段落前的 `<!-- block:xxx#bNN -->` 是程序注入的定位标记，不是正文内容。）
 
 {{SECTION_CONTENT}}

@@ -281,14 +281,6 @@ class DedupStore:
             rows = conn.execute(sql, (chat_id, limit)).fetchall()
         return [self._to_dead_letter(r) for r in rows]
 
-    # ---- [V7.1 清理] 已停用：仅 replay.py（死信重放，已停用）与被停用的测试使用。经全项目核对生产链路零引用，保留备查 ----
-    # def mark_replayed(self, letter_id: int) -> None:
-    #     with _open(self.db_path) as conn:
-    #         conn.execute(
-    #             "UPDATE dead_letters SET replayed = 1, replayed_at = ? WHERE id = ?",
-    #             (time.time(), letter_id),
-    #         )
-
     @staticmethod
     def _to_dead_letter(row: sqlite3.Row) -> DeadLetter:
         return DeadLetter(

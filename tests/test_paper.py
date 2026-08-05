@@ -104,7 +104,7 @@ def test_split_sections_no_headings():
 def test_real_templates_complete():
     """教学型精读模板必须齐全且含关键标记。"""
     from feishu_assistant.modules.reading import (
-        SKELETON_PATH,
+        PLAN_COMPILE_PATH,
         STYLE_PATH,
     )
     style = STYLE_PATH.read_text(encoding="utf-8")
@@ -114,10 +114,12 @@ def test_real_templates_complete():
     for section in ("问题模型", "案例按需使用", "讲法匹配对象", "反事实按需使用"):
         assert section in style
 
-    skeleton = SKELETON_PATH.read_text(encoding="utf-8")
-    assert "{{PAPER_CONTENT}}" in skeleton and "{{STYLE}}" in skeleton
+    skeleton = PLAN_COMPILE_PATH.read_text(encoding="utf-8")
+    assert "{{SOURCE_CONTENT}}" in skeleton and "{{STYLE}}" in skeleton
+    assert "{{GRAPH_CATALOG}}" in skeleton and "{{DEBT_REGISTRY}}" in skeleton
     assert "SIMILAR_PAPERS" not in skeleton
     for section in ("paper_type", "正文结构", "解释债务", "teaching_mode",
+                    "primary_assertion_id", "debt_ids", "coverage", "purposes",
                     "running_example", "layers"):
         assert section in skeleton
 
@@ -320,7 +322,7 @@ def test_normalize_paper_url():
 
 
 class _FakeSender:
-    """StatusMessenger 文本路径 + 结果/错误卡推送的 no-op sender。"""
+    """TaskCard 流式卡通道 + 结果/错误卡推送的 no-op sender。"""
 
     def __init__(self, msg_id: str = "om_status"):
         self.msg_id = msg_id
@@ -340,6 +342,18 @@ class _FakeSender:
 
     def update_text(self, message_id, text):
         return ""
+
+    def status_card_create(self, chat_id, text):
+        return self.msg_id  # 句柄；"" 表示首发失败（静默降级路径用例）
+
+    def rich_card_create(self, chat_id, card_json):
+        return self.msg_id  # TaskCard 整卡通道句柄；"" 表示首发失败（静默降级）
+
+    def status_card_update(self, handle, text):
+        return ""
+
+    def status_card_reactivate(self, handle):
+        return True
 
 
 class _FakeBitableDAO:
@@ -570,13 +584,17 @@ class _FakeStatus:
 
 
 class _RecordingSender(_FakeSender):
-    """在 _FakeSender 之上记录状态条帧写（定格帧断言用）。"""
+    """在 _FakeSender 之上记录状态条帧写（定格帧断言用；文本/卡片两通道合一）。"""
 
     def __init__(self, msg_id: str = "om_status"):
         super().__init__(msg_id)
         self.updates: list[str] = []
 
     def update_text(self, message_id, text):
+        self.updates.append(text)
+        return ""
+
+    def status_card_update(self, handle, text):
         self.updates.append(text)
         return ""
 
@@ -951,3 +969,80 @@ def test_resume_interrupted_one_failure_does_not_block_others(tmp_path):
     assert [c["kwargs"] for c in calls] == [{"arxiv_id": "ok"}]
     assert any("上次中断的精读任务已自动恢复：好任务" in t for _, t in outbox.items)
     _wait_task_status(svc, "arxiv:ok", "failed")  # 探针收尾
+
+
+# ---- V8 第 8 步收口：发布/落库/向量入库失败不判任务失败 ----
+
+def test_pipeline_store_and_vector_failure_still_delivers(tmp_path, monkeypatch):
+    """正文已交付即是成功：sqlite 落库失败、向量入库失败只警告+通知，
+    _pipeline 正常返回（文档链接不变），不抛异常。"""
+    from feishu_assistant.modules import paper as paper_mod
+    from feishu_assistant.modules.reading import ReadingResult
+
+    md_path = tmp_path / "paper.md"
+    md_path.write_text("# 全文", encoding="utf-8")
+    monkeypatch.setattr(paper_mod, "parse_pdf", lambda src, out: md_path)
+    monkeypatch.setattr(paper_mod, "load_figure_assets", lambda p: [])
+    monkeypatch.setattr(paper_mod, "load_formula_assets", lambda p: [])
+    monkeypatch.setattr(paper_mod, "pdf_page_count", lambda p: 1)
+    monkeypatch.setattr(paper_mod, "classify_direction", lambda *a, **k: "其他")
+
+    class _Engine:
+        def run(self, *args, **kwargs):
+            return ReadingResult(
+                body_md="# 已生成正文", metadata={"title_zh": "测试论文"},
+                layer_names=[], figure_notes={}, figure_inlines={}, vision_used=False)
+
+    class _Docx:
+        def create_document(self, name):
+            return "doc-id", "https://feishu.cn/docx/doc-id"
+
+        def grant_access(self, doc_id, open_id=None):
+            return True
+
+        def write_markdown(self, doc_id, body, images=None, strict_images=False):
+            return None
+
+    class _FailStore:
+        db_path = tmp_path / "fail.db"
+
+        def save_paper(self, *args, **kwargs):
+            raise RuntimeError("sqlite 宕机")
+
+    class _FailVector:
+        def add_paper(self, *args, **kwargs):
+            raise RuntimeError("向量索引宕机")
+
+    sender = _FakeSender()
+    svc = _make_service(tmp_path, _FakeKimi(), sender=sender)
+    svc.reading_engine = _Engine()
+    svc.docx = _Docx()
+    svc.store = _FailStore()
+    svc.vector_index = _FailVector()
+
+    metadata, doc_url, archived = svc._pipeline(
+        MessageContext(chat_id="c1"), tmp_path / "p.pdf",
+        key="k", pdf_url="https://example.com/p.pdf",
+        arxiv_id="2603.03329", meta_hint={})
+    assert doc_url == "https://feishu.cn/docx/doc-id"   # 正文照常交付
+    assert metadata["store_failed"] and metadata["vector_failed"]
+    assert any("落库失败" in t for t in sender.texts)    # 用户被通知
+    assert any("向量入库失败" in t for t in sender.texts)
+
+
+def test_run_guarded_degraded_v9_does_not_claim_final_review_pass(tmp_path):
+    svc = _make_service(tmp_path, _FakeKimi(), sender=_FakeSender())
+    status = _FakeStatus()
+
+    def degraded_job(context, **_):
+        return {
+            "title_zh": "论文",
+            "release_status": "fact_review_unavailable",
+            "final_review_degraded": "事实审查服务不可用",
+        }, "http://doc", True
+
+    svc._run_guarded(MessageContext(chat_id="c1"), "L", degraded_job, {}, status, "")
+
+    assert status.stopped == [(True, "精读完成，发布状态：事实审查未完成")]
+    assert "通过终审" not in status.stopped[0][1]
+    assert svc.sender.cards[0]["header"]["template"] == "orange"

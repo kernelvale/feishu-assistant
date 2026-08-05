@@ -123,16 +123,6 @@ def test_heavy_chain_uses_first_candidate():
     assert clients["free-tokens"].completions.calls[0]["model"] == "kimi-k3"
 
 
-# ---- [V7.1 清理] 已停用：对应生产代码 chat_auto 已停用。经全项目核对生产链路零引用，保留备查 ----
-# def test_chat_auto_routes_by_user_text():
-#     clients = make_clients([fake_message("r1"), fake_message("r2")])
-#     client = KimiClient(make_settings(), clients=clients)
-#     client.chat_auto(MSGS, "你好")
-#     client.chat_auto(MSGS, "帮我精读这篇论文")
-#     calls = clients["free-tokens"].completions.calls
-#     assert [call["model"] for call in calls] == ["kimi-k3", "kimi-k3"]
-#     assert is_heavy_task("复盘一下今天的面试") and not is_heavy_task("你好")
-
 
 # ---- 单模型失败通知（禁止自动切换） ----
 
@@ -603,6 +593,24 @@ def test_log_token_usage_accepts_both_protocol_shapes(caplog):
         _log_token_usage(None)
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("tokens:")]
     assert lines == ["tokens: in=100 cached=90 out=10", "tokens: in=200 cached=180 out=20"]
+
+
+def test_llm_stats_accumulate_at_usage_log_point():
+    """usage 日志点同步累加进程级统计：calls/cached_tokens/out_tokens；None 按 0 计。
+    计数器跨任务累计：断言用前后差值（同进程其他测试也会累加）。"""
+    from feishu_assistant.kimi import _log_token_usage, get_llm_stats
+    before = get_llm_stats()
+    _log_token_usage({"input_tokens": 100, "cache_read_input_tokens": 90,
+                      "output_tokens": 10})
+    _log_token_usage({"prompt_tokens": 200, "completion_tokens": 20,
+                      "prompt_tokens_details": {"cached_tokens": 180}})
+    _log_token_usage(None)              # 无 usage：不计
+    _log_token_usage({})                # 三项全 None：不计
+    _log_token_usage({"input_tokens": 5})  # out/cached 缺省按 0，仍计一次调用
+    after = get_llm_stats()
+    assert after["calls"] - before["calls"] == 3
+    assert after["cached_tokens"] - before["cached_tokens"] == 270
+    assert after["out_tokens"] - before["out_tokens"] == 30
 
 
 def test_anthropic_status_error_reads_streaming_body_safely():

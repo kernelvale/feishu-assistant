@@ -24,7 +24,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from ..config import PROJECT_ROOT
 from ..kimi import KimiClient, KimiError, KimiParameterError
@@ -39,7 +39,7 @@ logger = logging.getLogger("feishu_assistant.reading")
 
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 STYLE_PATH = PROMPTS_DIR / "paper_reading.md"        # 风格圣经
-SKELETON_PATH = PROMPTS_DIR / "reading_skeleton.md"
+PLAN_COMPILE_PATH = PROMPTS_DIR / "reading_plan_compile.md"  # PlanCompiler 规划协议（V8 第 3 步）
 
 HARD_INPUT_CAP = 200_000  # 仅保留给显式调用者；正式精读禁止使用字符硬截尾
 FIGURE_MAX_WORKERS = 3    # 独立逐图、受控并行；不把多张图塞进同一模型上下文
@@ -53,8 +53,11 @@ WRITER_OUTPUT_TOKENS = 32_768
 LOCAL_REVIEW_OUTPUT_TOKENS = 16_384
 FIGURE_OUTPUT_TOKENS = 16_384
 FINAL_REVIEW_OUTPUT_TOKENS = 24_576
-# 局审一次常抛出多条混合意见，一轮改写修不干净；允许两轮改写（验收标准不变），仍不过才判死
-LOCAL_REVIEW_MAX_REWRITES = 2
+# 正文修复预算（V8 第 6 步收敛）：block 补丁一次 + 整单元重写一次；仍失败 →
+# last_valid 恢复快照 + 批注交付（标准不变，机会收敛，产出优先）
+LOCAL_REVIEW_MAX_REWRITES = 1
+# plan/graph 类回流全局上限：每篇 ≤2 次（每单元每轮至多一次，同动作签名熔断）
+PLAN_REFLUX_MAX = 2
 # 风险分层：叙事/边界类章节只做结构检查（事实核查交终审），其余章节与 core 层逐节模型审
 LIGHT_REVIEW_SECTION_PURPOSES = frozenset({"orientation", "boundary"})
 
@@ -134,6 +137,19 @@ def _skeleton_review_check_gaps(
                for t in ("purpose", "mode", "功能举证", "模式举证")):
         gaps.append("checks 未覆盖 purpose/mode 举证")
 
+    gaps.extend(_review_checks_evidence_gaps(valid, chunk_ids, source))
+    return gaps
+
+
+def _review_checks_evidence_gaps(
+    valid: list[dict[str, Any]],
+    chunk_ids: set[str] | None,
+    source: str,
+) -> list[str]:
+    """checks 举证追溯门禁（骨架/Plan 审核共用）：evidence 必须可定位——
+    长文引用真实 chunk id；短文含可定位锚点（原文摘录/章节标题/图表标签），
+    引用不存在的章/节/图/chunk 或空泛指引即拒收。"""
+    gaps: list[str] = []
     for c in valid:
         evidence_text = str(c.get("evidence") or "").strip()
         label = str(c.get("item") or "").strip()[:30]
@@ -185,35 +201,189 @@ def _unit_binding_deps(unit: Any) -> dict[str, int]:
     return deps
 
 
+def _plan_boundary_pair(check: dict[str, Any]) -> tuple[str, str] | None:
+    """boundary check 的结构化层对：left/right 都非空才有效。"""
+    left = str(check.get("left_layer_id") or "").strip()
+    right = str(check.get("right_layer_id") or "").strip()
+    return (left, right) if left and right else None
+
+
+def _plan_boundary_ref_gaps(
+    check: dict[str, Any],
+    graph: Any | None,
+    registry: Any | None,
+) -> list[str]:
+    """boundary 判定的 lost_* 引用真实性：reviewer 可确认/修正程序预填，
+    但给出的债务/断言/span ID 必须真实存在（注册表降级时债务项只校验形状）。"""
+    gaps: list[str] = []
+    label = f"{check.get('left_layer_id')}→{check.get('right_layer_id')}"
+    debts = getattr(registry, "debts", None) or {}
+    registry_usable = bool(debts) and getattr(registry, "admission_status", "") != "degraded"
+    raw_debts = check.get("lost_debt_ids")
+    if raw_debts is not None:
+        if not isinstance(raw_debts, list):
+            gaps.append(f"boundary {label} 的 lost_debt_ids 必须是数组")
+        elif registry_usable:
+            unknown = [str(d) for d in raw_debts if str(d) not in debts]
+            if unknown:
+                gaps.append(f"boundary {label} 的 lost_debt_ids 引用不存在债务："
+                            + "、".join(unknown[:3]))
+    if graph is not None:
+        raw_assertions = check.get("lost_assertion_ids")
+        if raw_assertions is not None:
+            if not isinstance(raw_assertions, list):
+                gaps.append(f"boundary {label} 的 lost_assertion_ids 必须是数组")
+            else:
+                unknown = [str(a) for a in raw_assertions if str(a) not in graph.nodes]
+                if unknown:
+                    gaps.append(f"boundary {label} 的 lost_assertion_ids 引用"
+                                "不存在节点：" + "、".join(unknown[:3]))
+        raw_spans = check.get("evidence_span_ids")
+        if raw_spans is not None:
+            if not isinstance(raw_spans, list):
+                gaps.append(f"boundary {label} 的 evidence_span_ids 必须是数组")
+            else:
+                unknown = [str(s) for s in raw_spans if str(s) not in graph.spans]
+                if unknown:
+                    gaps.append(f"boundary {label} 的 evidence_span_ids 引用"
+                                "不存在 span：" + "、".join(unknown[:3]))
+    return gaps
+
+
 def _plan_review_check_gaps(
     checks: Any,
     plan: "ReadingPlan",
     source: str,
+    graph: Any | None = None,
+    registry: Any | None = None,
 ) -> list[str]:
-    """Plan Reviewer 的语义准入举证门禁（程序级）：复用骨架审核的反汇总覆盖逻辑
-    （多层逐层断链/单层核心主张/preparations/purpose·mode），另要求每条 check 带
-    可追溯 evidence 与指向真实单元的 target_ids。不合格不判死：由调用方 correction
-    重试一次，仍不合格标注「语义准入审核不完整」继续。"""
-    layers = [plan.units[uid].data for uid in (plan.order.get("layers") or [])
-              if uid in plan.units]
-    skeleton_data = {"layers": layers, "preparations": plan.preparations}
-    chunk_ids = set(re.findall(r"chunk-\d{3,4}", source)) or None
-    gaps = _skeleton_review_check_gaps(checks, skeleton_data, chunk_ids, source)
+    """PlanAuditor 准入 checks 门禁（程序级，fail-closed 但出口不判死）：
+
+    覆盖（V8 第 5 步 LayerContract 时代协议）：
+    - 逐 boundary 一条 outcome=pass 判定（结构化 left/right unit_id；
+      汇总冒充逐条拒收；fail/unknown 不得 clean）；lost_* 引用必须真实；
+    - 单层 Plan（无 boundary）必须有一条「核心主张」准入检查且 pass；
+    - 债务归属冲突 / preparations 分配 / purpose·mode 举证各一条且 pass；
+    - 每条 check：outcome 合法、evidence 可定位、target_ids 指向真实单元。
+    不合格不判死：由调用方 correction 重试一次，仍不合格标注
+    「语义准入审核不完整」继续。"""
+    from .reading_plan import BOUNDARY_OUTCOMES
+
+    if not isinstance(checks, list) or not checks:
+        return ["Plan 审核缺少 checks 举证明细"]
+    valid = [c for c in checks if isinstance(c, dict)]
+    if len(valid) != len(checks):
+        return ["checks 含非对象项"]
+    gaps: list[str] = []
+    layer_uids = [uid for uid in (plan.order.get("layers") or []) if uid in plan.units]
     valid_targets: set[str] = set(plan.units)
     for uid, unit in plan.units.items():
         for key in ("name", "title"):
             text = str(unit.data.get(key) or "").strip()
             if text:
                 valid_targets.add(text)
-    for check in [c for c in checks if isinstance(c, dict)] if isinstance(checks, list) else []:
+
+    # ---- 逐 boundary：结构化层对匹配（左右互换宽容），汇总冒充拒收 ----
+    boundary_checks: list[tuple[dict[str, Any], tuple[str, str]]] = []
+    for check in valid:
+        pair = _plan_boundary_pair(check)
+        if pair is not None:
+            boundary_checks.append((check, pair))
+        elif "boundary" in str(check.get("item") or "").lower() \
+                or "边界" in str(check.get("item") or ""):
+            gaps.append("boundary 检查必须逐条给出 left_layer_id/right_layer_id"
+                        "（汇总判定拒收）")
+    real_pairs = {(str(b.get("left_layer_id")), str(b.get("right_layer_id")))
+                  for b in plan.boundaries}
+    unmatched = [f"{left}→{right}" for _c, (left, right) in boundary_checks
+                 if (left, right) not in real_pairs
+                 and (right, left) not in real_pairs]
+    if unmatched:
+        gaps.append("boundary check 指向不存在的相邻层对：" + "、".join(unmatched[:3]))
+    for b in plan.boundaries:
+        left, right = str(b.get("left_layer_id")), str(b.get("right_layer_id"))
+        hit = next((c for c, pair in boundary_checks
+                    if pair == (left, right) or pair == (right, left)), None)
+        if hit is None:
+            gaps.append(f"checks 缺少 boundary 逐条判定：{left}→{right}")
+            continue
+        outcome = str(hit.get("outcome") or "").strip()
+        if outcome != "pass":
+            gaps.append(f"boundary {left}→{right} outcome={outcome or '缺失'}，"
+                        "clean 要求逐条 pass（fail/unknown 不得 clean）")
+        gaps.extend(_plan_boundary_ref_gaps(hit, graph, registry))
+
+    # ---- 单层 Plan：核心主张准入检查 ----
+    if not plan.boundaries and len(layer_uids) == 1:
+        hit = next((c for c in valid if "核心主张" in str(c.get("item") or "")), None)
+        if hit is None:
+            gaps.append("单层 Plan checks 缺少「单层核心主张」准入检查")
+        elif str(hit.get("outcome") or "").strip() != "pass":
+            gaps.append("单层核心主张准入检查 outcome 不是 pass，不得 clean")
+
+    # ---- 债务归属 / preparations / purpose·mode：各一条且 pass ----
+    for tokens, label in (
+        (("债务",), "债务归属冲突"),
+        (("preparations", "前置概念", "建立义务"), "preparations 分配"),
+        (("purpose", "mode", "功能举证", "模式举证"), "purpose/mode 举证"),
+    ):
+        hit = next((c for c in valid
+                    if any(t in str(c.get("item") or "") for t in tokens)), None)
+        if hit is None:
+            gaps.append(f"checks 未覆盖{label}")
+        elif str(hit.get("outcome") or "").strip() != "pass":
+            gaps.append(f"{label}检查 outcome 不是 pass，不得 clean")
+
+    # ---- 每条 check：outcome 合法 + target_ids 真实 + evidence 可定位 ----
+    for check in valid:
         label = str(check.get("item") or "").strip()[:30]
+        outcome = str(check.get("outcome") or "").strip()
+        if outcome not in BOUNDARY_OUTCOMES:
+            gaps.append(f"check「{label}」outcome 非法或缺失：{outcome or '空'}")
         targets = [str(t).strip() for t in (check.get("target_ids") or [])
                    if str(t).strip()]
         if not targets:
             gaps.append(f"check「{label}」缺 target_ids")
         elif any(t not in valid_targets for t in targets):
             gaps.append(f"check「{label}」target_ids 指向不存在单元")
+    chunk_ids = set(re.findall(r"chunk-\d{3,4}", source)) or None
+    gaps.extend(_review_checks_evidence_gaps(valid, chunk_ids, source))
     return gaps
+
+
+def _plan_merge_boundary_outcomes(plan: "ReadingPlan", checks: Any) -> int:
+    """把 reviewer 的逐 boundary 判定写回 plan.boundaries（outcome/reason/lost_*）。
+
+    只在准入门禁通过后调用（引用真实性已校验）；reviewer 未给的 lost_* 字段
+    保留程序预填值。返回写回条数。"""
+    from .reading_plan import BOUNDARY_OUTCOMES
+
+    if not isinstance(checks, list):
+        return 0
+    by_pair: dict[frozenset[str], dict[str, Any]] = {}
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        pair = _plan_boundary_pair(check)
+        if pair is not None:
+            by_pair[frozenset(pair)] = check
+    merged = 0
+    for boundary in plan.boundaries:
+        check = by_pair.get(frozenset((str(boundary.get("left_layer_id")),
+                                       str(boundary.get("right_layer_id")))))
+        if check is None:
+            continue
+        outcome = str(check.get("outcome") or "").strip()
+        if outcome not in BOUNDARY_OUTCOMES:
+            continue  # 防御：门禁外的非法判定不写回
+        boundary["outcome"] = outcome
+        boundary["reason"] = str(check.get("reason") or "").strip()
+        for field_name in ("lost_debt_ids", "lost_assertion_ids", "evidence_span_ids"):
+            raw = check.get(field_name)
+            if isinstance(raw, list):
+                boundary[field_name] = [str(v) for v in raw]
+        merged += 1
+    return merged
 
 
 def _full_map_text(skeleton: "Skeleton") -> str:
@@ -229,9 +399,15 @@ def _full_map_text(skeleton: "Skeleton") -> str:
             f"节{idx}《{section.get('title')}》（功能：{section.get('purpose')}）建立义务：{preps}"
         )
     for i, layer in enumerate(skeleton.layers, 1):
+        # 债务文本后附〔debt_id〕：审核器三分流判定与 debt_ids 引用的事实源
+        debt_ids = list(getattr(layer, "debt_ids", None) or [])
+        debt_items = [
+            f"{action}〔{debt_ids[d]}〕" if d < len(debt_ids) else action
+            for d, action in enumerate(layer.must_explain)
+        ]
         lines.append(
             f"层{i}《{layer.name}》（{layer.depth}）问题：{layer.question}；"
-            f"债务：{'、'.join(layer.must_explain)}"
+            f"债务：{'、'.join(debt_items)}"
         )
     return "\n".join(lines)
 
@@ -292,6 +468,105 @@ class ReadingError(Exception):
     """论文精读生成失败，信息为中文。"""
 
 
+class _PlanChecksIncomplete(Exception):
+    """Plan 审核 checks 未过准入门禁：走一次格式纠正，仍不合格标注继续。"""
+
+
+# PlanAuditor 预算（V8 第 5 步裁定）：一次格式纠正 + 最多两轮语义修复
+PLAN_MAX_REPAIR_ROUNDS = 2
+
+
+def _plan_action_sig(action: Any) -> str:
+    """修复动作签名（op+目标+参数）：重复动作熔断的对账凭据。"""
+    return "|".join([
+        str(action.op),
+        ",".join(sorted(str(t) for t in (action.target_ids or []))),
+        json.dumps(action.params or {}, ensure_ascii=False, sort_keys=True,
+                   default=str),
+    ])
+
+
+def _plan_review_issue_sig(review: dict[str, Any]) -> tuple[frozenset[str], int]:
+    """本轮审核 issue 身份集合与最高严重度（修复进展三选一判定的对账凭据）。"""
+    from .reading_debts import SEVERITY_RANK
+    from .reading_issues import ReviewIssue
+    ids: list[str] = []
+    max_sev = 0
+    for item in (review.get("issues") or []) if isinstance(review, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            issue = ReviewIssue.from_legacy(item, "plan")
+        except ValueError:
+            continue
+        ids.append(issue.issue_id)
+        max_sev = max(max_sev, SEVERITY_RANK.get(issue.severity, 0))
+    return frozenset(ids), max_sev
+
+
+# merge/split 语义的 plan 类 issue kind（第 7 步：优先 replace_plan_fragment 事务）
+FRAGMENT_REFLUX_KINDS = frozenset(
+    {"contract_gap", "debt_uncovered", "boundary_fail"})
+
+
+def _parse_fragment_repairs(raw_repairs: Any, plan_revision: int) -> list[Any]:
+    """审核器显式给出的 replace_plan_fragment 动作解析（v1/v2 字段兼容）。
+
+    版本号按当前 Plan 对齐（局审/终审材料不含 revision，乐观并发由引擎的
+    digest 校验把关）；非 fragment 动作与解析失败项跳过，不判死。"""
+    from .reading_repair import RepairAction, RepairRejected
+    actions: list[Any] = []
+    for item in (raw_repairs or []) if isinstance(raw_repairs, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("op") or "").strip() != "replace_plan_fragment":
+            continue
+        data = dict(item)
+        if not str(data.get("issue_id") or "").strip():
+            resolves = data.get("resolves_issue_ids") or []
+            data["issue_id"] = str(resolves[0]) if resolves else "reflux-fragment"
+        data["expected_plan_revision"] = plan_revision
+        data["expected_revisions"] = {}
+        try:
+            actions.append(RepairAction.from_dict(data))
+        except RepairRejected:
+            continue
+    return actions
+
+
+def _mechanical_fragment_params(replan_issues: list[Any],
+                                replan_targets: list[str],
+                                plan: Any, debts: Any) -> dict[str, Any]:
+    """merge/split 语义的机械翻译（无模型）：吸收到首个 target，其余退休；
+    issue 点名且无幸存 owner 的债务经 debt_changes 显式指派给继承层。
+    合法性由 RepairEngine 事务内的 validate_plan 把关，失败退 _local_replan。"""
+    keep = replan_targets[0]
+    retiring = set(replan_targets[1:])
+    params: dict[str, Any] = {
+        "target_ids": list(replan_targets),
+        "keeps": [keep],
+        "retires": [{"unit_id": t, "replaced_by": [keep]}
+                    for t in replan_targets[1:]],
+    }
+    keep_debts = set(plan.units[keep].data.get("debt_ids") or [])
+    changes: list[dict[str, str]] = []
+    for issue in replan_issues:
+        for did in issue.debt_ids:
+            if did not in debts or did in keep_debts:
+                continue
+            surviving_owners = [
+                uid for uid in (plan.order.get("layers") or [])
+                if uid in plan.units and uid not in retiring
+                and did in (plan.units[uid].data.get("debt_ids") or [])]
+            if surviving_owners:
+                continue
+            changes.append({"debt_id": did, "owner_layer_id": keep})
+            keep_debts.add(did)
+    if changes:
+        params["debt_changes"] = changes
+    return params
+
+
 # ---------------------------------------------------------------------------
 # 全文保留：只删参考文献列表节
 # ---------------------------------------------------------------------------
@@ -331,10 +606,15 @@ def _locate_failed_units(
     contract_gaps: list[str],
     figure_labels: set[str],
     plan: Any | None = None,
+    *,
+    block_index: dict[str, str] | None = None,
+    debt_owner: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], bool]:
     """终审失败定位：把失败原因映射到具体 层/节/图 的检查点键，返回
     （{检查点键: 返工意见}, 是否涉及 core 层核心链路）。无法定位时返回空映射
-    （调用方按 core 判死——修不了的问题不许交付）。"""
+    （调用方按 core 判死——修不了的问题不许交付）。
+    第 6 步：issues 优先用 body_block_ids → unit（block manifest 反查）与
+    debt_ids → owner（Plan 归属反查）结构化定位；展示名模糊匹配降为兼容兜底。"""
     units: dict[str, list[str]] = {}
     core_involved = False
 
@@ -342,6 +622,12 @@ def _locate_failed_units(
         nonlocal core_involved
         units.setdefault(key, []).append(note)
         core_involved = core_involved or core
+
+    def _uid_core(uid: str) -> bool:
+        if plan is None:
+            return False
+        unit = plan.units.get(uid)
+        return bool(unit is not None and unit.data.get("depth") == "core")
 
     layer_by_norm = {_normalize_heading(layer.name): (idx, layer)
                      for idx, layer in enumerate(skeleton.layers, 1)}
@@ -386,7 +672,7 @@ def _locate_failed_units(
             mark_layer_by_name(str(entry.get("layer") or ""),
                                "闭卷复述失败：" + str(entry.get("missing") or "无法复述"))
 
-    # ② issues[].location：按层名/节标题/图标签模糊归位
+    # ② issues[]：优先 block_id/debt_id 结构化定位；展示名模糊匹配兜底
     for item in review.get("issues") or []:
         if not isinstance(item, dict):
             continue
@@ -396,6 +682,22 @@ def _locate_failed_units(
             continue
         severity = str(item.get("severity") or "高").strip()
         placed = False
+        # block_id → unit（block manifest 反查，精确）
+        for bid in item.get("body_block_ids") or []:
+            uid = (block_index or {}).get(str(bid).strip())
+            if uid:
+                mark(f"body-{uid}", f"[{severity}] {problem}", core=_uid_core(uid))
+                placed = True
+        # debt_id → owner 层（Plan 归属反查，精确）
+        if not placed:
+            for did in item.get("debt_ids") or []:
+                uid = (debt_owner or {}).get(str(did).strip())
+                if uid:
+                    mark(f"body-{uid}", f"[{severity}] {problem}",
+                         core=_uid_core(uid))
+                    placed = True
+        if placed:
+            continue
         for norm, (idx, layer) in layer_by_norm.items():
             if norm and norm in location:
                 mark(_unit_key("layer", idx), f"[{severity}] {problem}",
@@ -622,6 +924,12 @@ class KeyLayer:
     source_refs: list[str] = field(default_factory=list)
     mode_reason: str = ""
     break_if_merged: dict[str, str] = field(default_factory=dict)
+    # V8 第 3 步：PlanCompiler 直出的 graph-ID / debt-ID（程序校验真实性后绑定）
+    primary_assertion_id: str = ""
+    debt_ids: list[str] = field(default_factory=list)
+    supporting_node_ids: list[str] = field(default_factory=list)
+    prerequisite_concept_ids: list[str] = field(default_factory=list)
+    source_span_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -634,6 +942,8 @@ class Skeleton:
     needs_running_example: bool = False
     sections: list[dict[str, Any]] = field(default_factory=list)
     deep_dive_title: str = "核心内容精讲"
+    # 全文覆盖义务声明：orientation/evidence/boundary 由哪节以何方式承担
+    coverage: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -792,7 +1102,12 @@ def _review_bool(value: Any) -> bool | None:
 
 
 def parse_skeleton_full(output: str) -> tuple[Skeleton, dict[str, Any]]:
-    """骨架输出 → (Skeleton, metadata)；调用方应先通过 skeleton_output_gaps 验收。"""
+    """PlanCompiler 输出 → (Skeleton, metadata)；调用方应先通过 skeleton_output_gaps 验收。
+
+    第 3 步协议：层直出 graph-ID/debt-ID（primary_assertion_id、debt_ids、
+    supporting_node_ids、prerequisite_concept_ids、source_span_ids）；
+    must_explain/success_test/break_if_merged 不再由 Planner 输出（出现则忽略），
+    由程序从债务注册表派生/预计算。"""
     _, data = extract_json_block(output)
     layers = [
         KeyLayer(
@@ -808,14 +1123,15 @@ def parse_skeleton_full(output: str) -> tuple[Skeleton, dict[str, Any]]:
             teaching_mode=str(l.get("teaching_mode") or "process").strip(),
             depth=str(l.get("depth") or "core").strip(),
             mode_reason=str(l.get("mode_reason") or "").strip(),
-            break_if_merged=(dict(l.get("break_if_merged"))
-                             if isinstance(l.get("break_if_merged"), dict) else {}),
-            must_explain=[
-                str(v).strip() for v in (l.get("must_explain") or []) if str(v).strip()
-            ],
-            success_test=[
-                str(v).strip() for v in (l.get("success_test") or []) if str(v).strip()
-            ],
+            primary_assertion_id=str(l.get("primary_assertion_id") or "").strip(),
+            debt_ids=[str(v).strip() for v in (l.get("debt_ids") or []) if str(v).strip()],
+            supporting_node_ids=[str(v).strip() for v in (l.get("supporting_node_ids") or [])
+                                 if str(v).strip()],
+            prerequisite_concept_ids=[str(v).strip()
+                                      for v in (l.get("prerequisite_concept_ids") or [])
+                                      if str(v).strip()],
+            source_span_ids=[str(v).strip() for v in (l.get("source_span_ids") or [])
+                             if str(v).strip()],
         )
         for l in (data.get("layers") or [])
         if isinstance(l, dict) and l.get("name")
@@ -828,22 +1144,41 @@ def parse_skeleton_full(output: str) -> tuple[Skeleton, dict[str, Any]]:
             question="论文的核心技术怎样把输入变成输出？",
         )]
     metadata = {k: data[k] for k in _METADATA_KEYS if k in data}
-    sections = [
-        {"purpose": str(item.get("purpose") or "").strip(),
-         "title": str(item.get("title") or "").strip(),
-         "purpose_reason": str(item.get("purpose_reason") or "").strip(),
-         "preparations": [
-             {"for_layer": str(p.get("for_layer") or "").strip(),
-              "concept": str(p.get("concept") or "").strip()}
-             for p in (item.get("preparations") or [])
-             if isinstance(p, dict) and str(p.get("concept") or "").strip()
-         ],
-         "source_refs": [
-             str(v).strip() for v in (item.get("source_refs") or []) if str(v).strip()
-         ][:12]}
-        for item in (data.get("sections") or [])
-        if isinstance(item, dict) and str(item.get("title") or "").strip()
-    ]
+
+    sections: list[dict[str, Any]] = []
+    for item in (data.get("sections") or []):
+        if not isinstance(item, dict) or not str(item.get("title") or "").strip():
+            continue
+        raw_purposes = item.get("purposes")
+        if isinstance(raw_purposes, list):
+            purposes = [str(v).strip() for v in raw_purposes if str(v).strip()]
+        else:
+            purposes = []
+        if not purposes:  # 兼容旧单值 purpose
+            single = str(item.get("purpose") or "").strip()
+            purposes = [single] if single else []
+        sections.append({
+            "purposes": purposes,
+            "purpose": purposes[0] if purposes else "",
+            "title": str(item.get("title") or "").strip(),
+            "purpose_reason": str(item.get("purpose_reason") or "").strip(),
+            "preparations": [
+                {"for_layer": str(p.get("for_layer") or "").strip(),
+                 "concept": str(p.get("concept") or "").strip(),
+                 "concept_id": str(p.get("concept_id") or "").strip()}
+                for p in (item.get("preparations") or [])
+                if isinstance(p, dict) and (str(p.get("concept") or "").strip()
+                                            or str(p.get("concept_id") or "").strip())
+            ],
+            "source_refs": [
+                str(v).strip() for v in (item.get("source_refs") or []) if str(v).strip()
+            ][:12],
+        })
+    coverage = {
+        str(k).strip(): str(v).strip()
+        for k, v in (data.get("coverage") or {}).items()
+        if str(k).strip() and str(v).strip()
+    } if isinstance(data.get("coverage"), dict) else {}
     return Skeleton(
         # Planner 的非 JSON 输出一律丢弃；Reader 正文只能来自受审核的 Writer。
         markdown="",
@@ -855,14 +1190,73 @@ def parse_skeleton_full(output: str) -> tuple[Skeleton, dict[str, Any]]:
         needs_running_example=bool(data.get("needs_running_example")),
         sections=sections,
         deep_dive_title=str(data.get("deep_dive_title") or "核心内容精讲").strip(),
+        coverage=coverage,
     ), metadata
+
+
+def _debt_registry_summary(registry: Any | None, graph: "SemanticGraph | None",
+                           max_chars: int = 6_000) -> str:
+    """Canonical DebtRegistry 摘要（PlanCompiler prompt 注入用）：
+    debt_id | kind | subject statement | relation | learner_action（截断）。
+
+    注册表缺失/为空/degraded 时给出明确「不可用」说明——Planner 退化为
+    不用 debt_ids 的模式（各层 debt_ids 给空数组），程序侧按 degraded 标注继续。
+    """
+    debts = getattr(registry, "debts", None) or {}
+    order = getattr(registry, "order", None) or []
+    usable = bool(debts) and getattr(registry, "admission_status", "") != "degraded"
+    if not usable:
+        reason = ""
+        issues = getattr(registry, "issues", None) or []
+        if issues:
+            reason = f"（{issues[0]}）"
+        return (
+            f"债务注册表不可用{reason}：本次规划不使用 debt_ids，"
+            "所有层的 debt_ids 必须给空数组；每层的 must_explain/success_test "
+            "由程序兜底派生，你只需给准 primary_assertion_id 与 question。"
+        )
+    lines: list[str] = []
+    used = 0
+    for did in order:
+        debt = debts.get(did)
+        if debt is None:
+            continue
+        subject = debt.subject_node_id
+        if graph is not None and subject in graph.nodes:
+            subject = graph.nodes[subject].statement
+        action = re.sub(r"\s+", " ", debt.learner_action).strip()
+        if len(action) > 60:
+            action = action[:60] + "…"
+        subject_text = re.sub(r"\s+", " ", subject).strip()
+        if len(subject_text) > 60:
+            subject_text = subject_text[:60] + "…"
+        line = f"{did} | {debt.kind} | {subject_text} | {debt.relation} | {action}"
+        if used + len(line) + 1 > max_chars:
+            remaining = len(order) - len(lines)
+            lines.append(f"…（{remaining} 条债务超出摘要预算已省略，不得引用）")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    header = (f"共 {len(lines)} 条在册债务；debt_ids 只能引用下列真实 debt_id，"
+              "每条债务只能归一层：")
+    return header + "\n" + "\n".join(lines)
 
 
 def skeleton_output_gaps(
     output: str,
     evidence: EvidenceBundle | None = None,
+    graph: "SemanticGraph | None" = None,
+    registry: Any | None = None,
 ) -> list[str]:
-    """只验 JSON 教学计划；模型额外输出的正文既不发布，也不参与验收。"""
+    """PlanCompiler 输出验收（第 3 步协议）：只验 JSON 教学计划；
+    模型额外输出的正文既不发布，也不参与验收。
+
+    与旧骨架协议的差异：sections 用 purposes 数组 + coverage 全文覆盖义务声明
+    （不再强制 orientation/evidence/boundary 各自单独成节）；层直出 graph-ID
+    （primary_assertion_id/supporting_node_ids/prerequisite_concept_ids/
+    source_span_ids，程序校验真实性）与 debt_ids（只能引注册表真实债务）；
+    must_explain/success_test/break_if_merged 不再由 Planner 输出（出现则忽略）。
+    """
     _, data = extract_json_block(output)
     gaps: list[str] = []
     if not data:        return ["元数据 JSON 无法解析"]
@@ -874,17 +1268,20 @@ def skeleton_output_gaps(
     if not isinstance(raw_sections, list) or not raw_sections:
         gaps.append("缺少动态章节规划 sections")
     else:
-        purposes: list[str] = []
         for idx, section in enumerate(raw_sections, 1):
             if not isinstance(section, dict):
                 gaps.append(f"第 {idx} 个章节规划不是对象")
                 continue
-            purpose = str(section.get("purpose") or "").strip()
+            raw_purposes = section.get("purposes")
+            purposes = ([str(v).strip() for v in raw_purposes if str(v).strip()]
+                        if isinstance(raw_purposes, list) else [])
+            if not purposes:  # 兼容旧单值 purpose
+                single = str(section.get("purpose") or "").strip()
+                purposes = [single] if single else []
             title = str(section.get("title") or "").strip()
-            if not purpose or not title:
-                gaps.append(f"第 {idx} 个章节规划缺少 purpose 或 title")
+            if not purposes or not title:
+                gaps.append(f"第 {idx} 个章节规划缺少 purposes 或 title")
                 continue
-            purposes.append(purpose)
             reason = str(section.get("purpose_reason") or "").strip()
             if not reason or re.fullmatch(
                 r"(?:因为|由于)?(?:需要|应该|有必要)?(?:介绍|说明|讲清|解释|阐述)(?:本文|该文|论文)?(?:的)?(?:内容|原理|方法|背景|意义|价值)?[。.]?",
@@ -905,16 +1302,19 @@ def skeleton_output_gaps(
                     gaps.append(f"第 {idx} 个章节 preparations 含非对象项")
                     continue
                 concept = str(prep.get("concept") or "").strip()
+                concept_id = str(prep.get("concept_id") or "").strip()
                 for_layer = str(prep.get("for_layer") or "").strip()
-                if not concept or not for_layer:
+                if not (concept or concept_id) or not for_layer:
                     gaps.append(f"第 {idx} 个章节 preparations 项缺少 concept 或 for_layer")
                     continue
                 prep_refs.append((for_layer, str(section.get("title") or "")))
-                concept_key = re.sub(r"[^\w一-鿿]+", "", concept).casefold()
+                # 唯一性按 concept_id（直出身份）或归一文本（兼容）判定
+                concept_key = concept_id or re.sub(
+                    r"[^\w一-鿿]+", "", concept).casefold()
                 owner = str(section.get("title") or "")
                 if concept_key in owners and owners[concept_key] != owner:
                     gaps.append(
-                        f"前置概念「{concept}」被重复分配给多个建立章节"
+                        f"前置概念「{concept or concept_id}」被重复分配给多个建立章节"
                         f"（{owners[concept_key]}、{owner}）"
                     )
                 else:
@@ -926,9 +1326,15 @@ def skeleton_output_gaps(
         ]
         if len(set(normalized_titles)) != len(normalized_titles):
             gaps.append("动态章节标题重复")
-        for required_purpose in ("orientation", "evidence", "boundary"):
-            if required_purpose not in purposes:
-                gaps.append(f"章节规划缺少功能：{required_purpose}")
+    # 全文覆盖义务声明：orientation/evidence/boundary 必须逐项声明承担方式
+    coverage = data.get("coverage")
+    if not isinstance(coverage, dict):
+        gaps.append("缺少 coverage 全文覆盖义务声明（orientation/evidence/boundary）")
+    else:
+        for required in ("orientation", "evidence", "boundary"):
+            text = str(coverage.get(required) or "").strip()
+            if len(text) < 8:
+                gaps.append(f"coverage 缺少 {required} 的有效承担方式声明")
     deep_dive_title = str(data.get("deep_dive_title") or "").strip()
     if not deep_dive_title:
         gaps.append("缺少 deep_dive_title")
@@ -937,6 +1343,12 @@ def skeleton_output_gaps(
         for item in raw_sections
     ):
         gaps.append("deep_dive_title 不能与骨架正文章节重复")
+    # 图/注册表可用性决定 ID 检查口径（弱图/无注册表 → 对应检查跳过或收紧）
+    graph_has_assertions = bool(graph is not None and any(
+        n.kind == "assertion" for n in graph.nodes.values()))
+    debts = getattr(registry, "debts", None) or {}
+    registry_usable = bool(debts) and getattr(
+        registry, "admission_status", "") != "degraded"
     raw_layers = data.get("layers")
     if not isinstance(raw_layers, list):
         gaps.append("教学层必须是数组")
@@ -948,6 +1360,8 @@ def skeleton_output_gaps(
         )
         layer_names: list[str] = []
         layer_questions: list[str] = []
+        primary_seen: dict[str, int] = {}
+        debt_seen: dict[str, int] = {}
         for idx, layer in enumerate(raw_layers, 1):
             if not isinstance(layer, dict):
                 gaps.append(f"第 {idx} 层不是对象")
@@ -979,39 +1393,57 @@ def skeleton_output_gaps(
                 and str(layer.get("output") or "").strip()
             ):
                 gaps.append(f"第 {idx} 层 process 模式缺少 input 或 output")
-            for debt_field in ("must_explain", "success_test"):
-                debts = layer.get(debt_field)
-                if (not isinstance(debts, list) or not debts
-                        or not all(isinstance(v, str) and v.strip() for v in debts)):
-                    gaps.append(f"第 {idx} 层缺少 {debt_field}")
-                elif any(re.fullmatch(
-                    r"(?:讲清|解释|说明|介绍|理解|掌握|知道)(?:本层|该层|该机制|核心)?(?:原理|作用|内容|方法)?[。.]?",
-                    value.strip(), re.IGNORECASE,
-                ) for value in debts):
-                    gaps.append(f"第 {idx} 层 {debt_field} 过于空泛")
             mode_reason = str(layer.get("mode_reason") or "").strip()
             if not mode_reason:
                 gaps.append(f"第 {idx} 层缺少 mode_reason（mode 举证）")
-            # 断链声明：层数 ≥ 2 必填，into 必须是相邻层，breaks 不得为空或套话
-            if len(raw_layers) >= 2:
-                bim = layer.get("break_if_merged")
-                if not isinstance(bim, dict):
-                    gaps.append(f"第 {idx} 层缺少 break_if_merged 断链声明")
+            # ---- 直出 ID 真实性（编造 ID 一律拒收，由 correction 修正一次）----
+            if graph_has_assertions:
+                primary = str(layer.get("primary_assertion_id") or "").strip()
+                if not primary:
+                    gaps.append(f"第 {idx} 层缺少 primary_assertion_id")
                 else:
-                    into = str(bim.get("into") or "").strip()
-                    breaks = str(bim.get("breaks") or "").strip()
-                    neighbors = {
-                        str(raw_layers[j].get("name", "")).strip()
-                        for j in (idx - 2, idx)
-                        if 0 <= j < len(raw_layers) and isinstance(raw_layers[j], dict)
-                    }
-                    if into not in neighbors:
-                        gaps.append(f"第 {idx} 层 break_if_merged.into 非相邻层：{into or '空'}")
-                    if not breaks or re.fullmatch(
-                        r"(?:讲清|解释|说明|理解|掌握|失去|缺少).{0,20}(?:原理|作用|内容|方法|知识)?[。.]?",
-                        breaks, re.IGNORECASE,
-                    ):
-                        gaps.append(f"第 {idx} 层 break_if_merged.breaks 为空或套话")
+                    node = graph.nodes.get(primary)
+                    if node is None:
+                        gaps.append(f"第 {idx} 层 primary_assertion_id 不存在：{primary}")
+                    elif node.kind != "assertion":
+                        gaps.append(f"第 {idx} 层 primary 指向非 assertion 节点：{primary}")
+                    elif primary in primary_seen:
+                        gaps.append(f"第 {idx} 层与第 {primary_seen[primary]} 层共用同一 "
+                                    f"primary assertion：{primary}")
+                    else:
+                        primary_seen[primary] = idx
+                for id_field in ("supporting_node_ids", "prerequisite_concept_ids"):
+                    value = layer.get(id_field) or []
+                    if not isinstance(value, list):
+                        gaps.append(f"第 {idx} 层 {id_field} 必须是数组")
+                        continue
+                    for nid in value:
+                        if str(nid).strip() and str(nid).strip() not in graph.nodes:
+                            gaps.append(f"第 {idx} 层 {id_field} 引用不存在的图节点：{nid}")
+                spans = layer.get("source_span_ids") or []
+                if not isinstance(spans, list):
+                    gaps.append(f"第 {idx} 层 source_span_ids 必须是数组")
+                else:
+                    for sid in spans:
+                        if str(sid).strip() and str(sid).strip() not in graph.spans:
+                            gaps.append(f"第 {idx} 层 source_span_ids 引用不存在的 span：{sid}")
+            raw_debt_ids = layer.get("debt_ids") or []
+            debt_ids = ([str(v).strip() for v in raw_debt_ids if str(v).strip()]
+                        if isinstance(raw_debt_ids, list) else [])
+            if registry_usable:
+                if not debt_ids:
+                    gaps.append(f"第 {idx} 层缺少 debt_ids（每层至少 1 条独占债务）")
+                for did in debt_ids:
+                    if did not in debts:
+                        gaps.append(f"第 {idx} 层引用注册表外的债务：{did}")
+                    elif did in debt_seen:
+                        gaps.append(f"债务 {did} 被第 {debt_seen[did]} 层与第 {idx} 层"
+                                    "重复引用（一条债务只能归一层）")
+                    else:
+                        debt_seen[did] = idx
+            elif debt_ids:
+                gaps.append(f"第 {idx} 层引用了 debt_ids，但债务注册表不可用"
+                            "（注册表缺失/为空/degraded 时 debt_ids 必须给空数组）")
         normalized_names = [re.sub(r"[^\w一-鿿]+", "", v).casefold()
                             for v in layer_names]
         normalized_questions = [re.sub(r"[^\w一-鿿]+", "", v).casefold()
@@ -1086,64 +1518,6 @@ def skeleton_output_gaps(
             if isinstance(layer, dict):
                 validate_refs(f"第 {idx} 个教学层", layer)
     return gaps
-
-
-# ---- [V7.1 清理] 已停用：V3 长文按 source_hints 挑本层章节（_markdown_sections / select_layer_source），已被证据索引取代。经全项目核对生产链路零引用，保留备查 ----
-# def _markdown_sections(md: str) -> list[tuple[str, str]]:
-#     """复用证据层的围栏感知 Markdown 切分器。"""
-#     return split_markdown_sections(md)
-#
-#
-# def select_layer_source(paper_md: str, layer: KeyLayer, max_chars: int = 70_000) -> str:
-#     """长论文按骨架给出的来源提示挑本层章节；短论文保留全文。"""
-#     if len(paper_md) <= max_chars:
-#         return paper_md
-#     sections = _markdown_sections(paper_md)
-#     hints = [*layer.source_hints, layer.name, layer.question, layer.input, layer.output]
-#     terms: set[str] = set()
-#     for hint in hints:
-#         terms.update(t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}", hint))
-#     priority_re = re.compile(r"abstract|introduction|conclusion|摘要|引言|结论", re.IGNORECASE)
-#     ranked: list[tuple[int, int, str]] = []
-#     for order, (title, section) in enumerate(sections):
-#         haystack = f"{title}\n{section}".lower()
-#         score = sum(3 if term in title.lower() else 1 for term in terms if term in haystack)
-#         if priority_re.search(title):
-#             score += 2
-#         ranked.append((score, -order, section))
-#     selected: list[str] = []
-#     total = 0
-#     for score, _, section in sorted(ranked, reverse=True):
-#         if score <= 0 and selected:
-#             continue
-#         remaining = max_chars - total
-#         if remaining <= 0:
-#             break
-#         selected.append(section[:remaining])
-#         total += min(len(section), remaining)
-#     return "\n\n".join(selected) or paper_md[:max_chars]
-
-
-def continuity_context(previous_layers: list[str], max_chars: int = 8_000) -> str:
-    """保留首层术语定义和最近层状态，避免长链路截掉基础概念。"""
-    if not previous_layers:
-        return "（这是第一层，尚无前文技术层。）"
-    chunks: list[str] = []
-    for text in previous_layers:
-        if len(text) <= 1800:
-            chunks.append(text)
-        else:
-            chunks.append(text[:1100] + "\n……\n" + text[-600:])
-    joined = "\n\n".join(chunks)
-    if len(joined) <= max_chars:
-        return joined
-    first = chunks[0]
-    if len(first) >= max_chars:
-        return first[:max_chars]
-    separator = "\n\n……（中间层上下文已压缩）……\n\n"
-    tail_budget = max(0, max_chars - len(first) - len(separator))
-    tail = "\n\n".join(chunks[1:])[-tail_budget:] if tail_budget else ""
-    return (first + separator + tail)[:max_chars]
 
 
 # ---------------------------------------------------------------------------
@@ -1540,6 +1914,9 @@ def classify_direction(kimi: KimiClient, title: str, tldr: str) -> str:
 # ---------------------------------------------------------------------------
 
 class ReadingEngine:
+    # 历史 V8 引擎继续使用 reading-v4 工作区；正式生产入口由 V9ReadingEngine 接管。
+    workspace_version = PIPELINE_VERSION
+
     def __init__(
         self,
         kimi: KimiClient,
@@ -1549,6 +1926,12 @@ class ReadingEngine:
         self.prompts_dir = prompts_dir
         self._vision_ok: bool | None = None
         self._fingerprint_cache: str | None = None
+        # V8 第 4 步：统一问题台账（run() 起点加载/重开；审核器出口归一入册）
+        self._issue_ledger: Any | None = None
+        # V8 第 6 步：plan/graph 类回流预算（run() 首跑重置，递归重跑继承）
+        self._reflux_count = 0
+        self._reflux_sigs: set[str] = set()
+        self._graph_rebound: set[str] = set()
 
     def workflow_fingerprint(self) -> str:
         """缓存语义指纹：协议代码或任一精读 prompt 变化都会自动失效旧检查点。"""
@@ -1560,7 +1943,9 @@ class ReadingEngine:
             digest.update(path.read_bytes())
         for path in (Path(__file__), Path(__file__).with_name("reading_evidence.py"),
                      Path(__file__).with_name("reading_graph.py"),
-                     Path(__file__).with_name("reading_plan.py")):
+                     Path(__file__).with_name("reading_plan.py"),
+                     Path(__file__).with_name("reading_blocks.py"),
+                     Path(__file__).with_name("reading_continuity.py")):
             digest.update(path.read_bytes())
         self._fingerprint_cache = digest.hexdigest()[:20]
         return self._fingerprint_cache
@@ -1637,12 +2022,26 @@ class ReadingEngine:
     def _style(self) -> str:
         return _load(self.prompts_dir / "paper_reading.md")
 
-    def build_skeleton_prompt(self, paper_md: str, figures: list[FigureAsset],
-                              formulas: list[FormulaAsset] | None = None) -> str:
+    def build_plan_compile_prompt(
+        self, paper_md: str, figures: list[FigureAsset],
+        formulas: list[FormulaAsset] | None = None, *,
+        graph: "SemanticGraph | None" = None,
+        registry: Any | None = None,
+    ) -> str:
+        """PlanCompiler 规划 prompt（第 3 步）：原文包 + 图目录 + 债务注册表摘要
+        （CACHE_BREAK 前共享前缀），任务协议在哨兵后。"""
+        from .reading_graph import render_graph_catalog  # 延迟导入防环
+
+        catalog = (render_graph_catalog(graph)
+                   if graph is not None and (graph.nodes or graph.spans)
+                   else "（语义图不可用：无 node/span 目录可引，"
+                        "各 ID 字段按空数组输出）")
         return _render(
-            _load(self.prompts_dir / "reading_skeleton.md"),
+            _load(self.prompts_dir / "reading_plan_compile.md"),
             STYLE=self._style(),
-            PAPER_CONTENT=paper_md,
+            SOURCE_CONTENT=paper_md,
+            GRAPH_CATALOG=catalog,
+            DEBT_REGISTRY=_debt_registry_summary(registry, graph),
         ) + (
             "\n\n## 本文图表清单（配对成功，写作时按编号引用）\n\n"
             + figure_inventory_text(figures)
@@ -1653,10 +2052,11 @@ class ReadingEngine:
     def build_layer_prompt(self, skeleton: Skeleton, layer: KeyLayer,
                            idx: int, total: int, paper_md: str,
                            figures: list[FigureAsset],
-                           previous_layers: list[str] | None = None,
+                           continuity_state: dict[str, Any] | None = None,
                            formulas: list[FormulaAsset] | None = None,
                            evidence: EvidenceBundle | None = None) -> str:
-        """单层教学 prompt：带相关来源章节和前文连续状态。"""
+        """单层教学 prompt：带相关来源章节和前文连续状态（第 8 步起为
+        ContinuityLedger 按真实依赖装包的条目，不再是前层全文）。"""
         formulas = formulas or []
         formula_by_key = {normalize_formula_label(asset.label): asset for asset in formulas}
         hinted: list[FormulaAsset] = []
@@ -1693,7 +2093,10 @@ class ReadingEngine:
             ),
             RUNNING_EXAMPLE=skeleton.running_example or "无；本层不得临时编造案例",
             SKELETON=self._plan_text(skeleton, focus_layer=layer.name),
-            CONTINUITY_CONTEXT=continuity_context(previous_layers or []),
+            CONTINUITY_CONTEXT=json.dumps(
+                continuity_state or {"defined_terms": [], "established_claims": [],
+                                     "open_questions": []},
+                ensure_ascii=False, indent=2),
             FIGURE_HINTS=figure_inventory_text(figures),
             FORMULA_HINTS=formula_inventory_text(
                 hinted, empty_scope="layer" if formulas else "paper",
@@ -1892,9 +2295,13 @@ class ReadingEngine:
         patched_content: str,
         correction: str,
         source: str,
+        *,
+        context_override: str | None = None,
     ) -> dict[str, Any]:
         """补丁复核：只审改动区域（合同覆盖与连续性首轮已验、补丁外内容未变，
         不重审整节）。输出与局审同构（pass/issues），continuity 不更新。
+        context_override：块级机械操作（delete/move blocks）时由调用方给出
+        改动块+相邻句上下文，替代 _patched_context 的补丁锚点定位。
         复核不可用（KimiError/连续非法 JSON）口径：revert_patch=True——放弃
         未验证的补丁、保留补丁前正文、标注，重写 0 次（与 _try_patch 对齐）。"""
         edits_summary = json.dumps([
@@ -1902,7 +2309,8 @@ class ReadingEngine:
              "replace": str(e.get("replace") or "")[:80]}
             for e in edits if isinstance(e, dict)
         ], ensure_ascii=False)
-        context = _patched_context(patched_content, edits)
+        context = context_override if context_override is not None \
+            else _patched_context(patched_content, edits)
         prompt = _render(
             _load(self.prompts_dir / "reading_patch_review.md"),
             SOURCE_CONTENT=source,
@@ -2095,6 +2503,182 @@ class ReadingEngine:
         idx = min(candidates)
         return paper_md[max(0, idx - span): idx + span]
 
+    def _compile_debts(
+        self,
+        graph: "SemanticGraph",
+        source_material: str,
+        client: Any,
+        workspace: ReadingWorkspace | None,
+    ) -> tuple["DebtRegistry", dict[str, Any]]:
+        """DebtCompiler（第 2 步）：图目录 + 原文包 → 候选债务 → 程序算 ID/去重/校验。
+
+        口径（产出优先，绝不判死）：
+        - 命中 workspace 的 debt-registry.json（schema 匹配）直接复用并返回；
+        - 弱图（零 assertion）→ 空 Registry + degraded 标注，不空烧模型调用；
+        - KimiError / 连续非法 JSON → 空 Registry + degraded + notes；
+        - validate 有 gaps（编造 ID/空字段）→ 带 correction 重试一次 →
+          仍有 gaps 则剔除非法项继续（记入 registry.issues 与 stats.notes）。
+        返回 (registry, stats{compile_calls, dedup_removed, notes})。"""
+        from .reading_debts import DEBT_REGISTRY_SCHEMA, DebtRegistry
+        from .reading_graph import render_graph_catalog
+
+        notes: list[str] = []
+        stats: dict[str, Any] = {"compile_calls": 0, "dedup_removed": 0, "notes": notes}
+        registry = DebtRegistry()
+        if workspace is not None:
+            cached = workspace.get_json("debt-registry")
+            if isinstance(cached, dict) and cached.get("schema") == DEBT_REGISTRY_SCHEMA:
+                try:
+                    registry = DebtRegistry.from_dict(cached)
+                    logger.info("债务注册表命中检查点：%d 条债务（%s）",
+                                len(registry.debts), registry.admission_status)
+                    notes.append("债务注册表命中检查点，直接复用")
+                    return registry, stats
+                except (ValueError, TypeError, KeyError):
+                    logger.warning("债务注册表检查点损坏，重新编译")
+
+        def _persist() -> None:
+            if workspace is not None:
+                workspace.put_json("debt-registry", registry.to_dict())
+
+        def _degraded_empty(reason: str) -> tuple["DebtRegistry", dict[str, Any]]:
+            # 产出优先：编译不可用 → 空 Registry + degraded 批注继续，绝不判死
+            registry.admission_status = "degraded"
+            registry.issues.append(reason)
+            notes.append(reason)
+            logger.warning("债务编译降级：%s", reason)
+            _persist()
+            return registry, stats
+
+        # 弱图（零 assertion）：债务池必薄，标注降级继续（现实张力裁定 2）
+        if not any(n.kind == "assertion" for n in graph.nodes.values()):
+            return _degraded_empty("弱图（零 assertion）：债务编译跳过，空 Registry 降级继续")
+
+        prompt = _render(
+            _load(self.prompts_dir / "reading_debt_compile.md"),
+            SOURCE_CONTENT=source_material,
+            GRAPH_CATALOG=render_graph_catalog(graph),
+        )
+        try:
+            raw = client.chat(
+                [{"role": "user", "content": prompt}],
+                heavy=True, json_mode=True, low_reasoning=True,
+                max_tokens=LOCAL_REVIEW_OUTPUT_TOKENS,
+            )
+            stats["compile_calls"] += 1
+        except KimiError as exc:
+            return _degraded_empty(f"DebtCompiler 调用失败：{str(exc)[:160]}")
+        payload: dict[str, Any] | None = None
+        for _attempt in range(2):
+            try:
+                payload = _json_object(raw)
+                break
+            except (json.JSONDecodeError, ValueError):
+                # 非法输出不立即判死：带修正指令重试（最多两次），仍非法才降级
+                try:
+                    raw = client.chat(
+                        [{"role": "user", "content": (
+                            prompt + "\n\n## 本次必须修正\n"
+                            "上一次输出无法解析为 JSON。只输出一个 JSON 对象，不要任何解释、"
+                            "前后缀或 markdown 围栏；字段与要求保持一致。"
+                        )}],
+                        heavy=True, json_mode=True, low_reasoning=True,
+                        max_tokens=LOCAL_REVIEW_OUTPUT_TOKENS,
+                    )
+                    stats["compile_calls"] += 1
+                except KimiError as exc:
+                    return _degraded_empty(
+                        f"DebtCompiler 重试调用失败：{str(exc)[:160]}")
+        if payload is None:
+            # 末次重试的结果同样要解析：直接丢弃会白烧一次调用还误判失败
+            try:
+                payload = _json_object(raw)
+            except (json.JSONDecodeError, ValueError):
+                return _degraded_empty("DebtCompiler 连续返回非法 JSON")
+
+        registry, gaps = self._debts_from_payload(payload, graph)
+        if gaps:
+            # 编造 ID/空字段：带 correction 重试一次（唯一一次），回灌程序检出的缺口
+            correction = "；".join(gaps[:8])
+            logger.warning("债务编译检出 %d 项缺口（带 correction 重试一次）：%s",
+                           len(gaps), correction[:200])
+            try:
+                raw2 = client.chat(
+                    [{"role": "user", "content": (
+                        prompt + "\n\n## 上一次输出存在非法债务项\n" + correction
+                        + "\n请修正后重新完整输出（仍是一个 JSON 对象，"
+                          "core_assertion_ids + debts）。"
+                    )}],
+                    heavy=True, json_mode=True, low_reasoning=True,
+                    max_tokens=LOCAL_REVIEW_OUTPUT_TOKENS,
+                )
+                stats["compile_calls"] += 1
+            except KimiError as exc:
+                notes.append(
+                    f"债务编译 correction 调用失败，保留首版并剔除非法项：{str(exc)[:120]}")
+                self._prune_illegal_debts(registry, gaps, graph, notes)
+                stats["dedup_removed"] = registry.duplicate_count
+                _persist()
+                return registry, stats
+            try:
+                payload2 = _json_object(raw2)
+            except (json.JSONDecodeError, ValueError):
+                payload2 = None
+            if payload2 is not None:
+                registry2, gaps2 = self._debts_from_payload(payload2, graph)
+                if len(gaps2) < len(gaps):
+                    # 重试版更优才采用；同等不折腾，保留首版
+                    registry, gaps = registry2, gaps2
+        if gaps:
+            # 仍有缺口：剔除 validate 点名的非法项，其余保留（批注可审计）
+            self._prune_illegal_debts(registry, gaps, graph, notes)
+        stats["dedup_removed"] = registry.duplicate_count
+        _persist()
+        logger.info("债务编译完成：%d 条债务入册（去重 %d 条，调用 %d 次）",
+                    len(registry.debts), registry.duplicate_count,
+                    stats["compile_calls"])
+        return registry, stats
+
+    @staticmethod
+    def _debts_from_payload(
+        payload: dict[str, Any], graph: "SemanticGraph",
+    ) -> tuple["DebtRegistry", list[str]]:
+        """模型输出 → DebtRegistry：程序算 debt_id、同 ID 幂等去重、validate 收集 gaps。"""
+        from .reading_debts import DebtRegistry, DebtSpec
+
+        registry = DebtRegistry()
+        items = payload.get("debts")
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            if isinstance(item, dict):
+                registry.add(DebtSpec.from_payload(item))
+        return registry, registry.validate(graph)
+
+    @staticmethod
+    def _prune_illegal_debts(
+        registry: "DebtRegistry", gaps: list[str], graph: "SemanticGraph",
+        notes: list[str],
+    ) -> list[str]:
+        """剔除 validate 点名的非法债务项（编造 ID/空字段），批注后继续。
+
+        返回剔除后仍剩余的 gaps（未点名具体债务的表级缺口）。"""
+        bad_ids: set[str] = set()
+        for gap in gaps:
+            match = re.match(r"债务 (debt-[0-9a-f]+)", gap)
+            if match:
+                bad_ids.add(match.group(1))
+        for debt_id in sorted(bad_ids):
+            if registry.remove(debt_id):
+                notes.append(f"剔除非法债务 {debt_id}")
+        remaining = registry.validate(graph)
+        for gap in remaining:
+            registry.issues.append(f"编译侧未决缺口：{gap}")
+        if bad_ids:
+            notes.append(f"债务编译剔除 {len(bad_ids)} 条非法项（编造 ID/空字段），"
+                         "其余保留待审")
+        return remaining
+
     def _call_skeleton(
         self,
         paper_md: str,
@@ -2104,8 +2688,10 @@ class ReadingEngine:
         client: Any | None = None,
         workspace: ReadingWorkspace | None = None,
         evidence: EvidenceBundle | None = None,
+        graph: "SemanticGraph | None" = None,
+        registry: Any | None = None,
     ) -> tuple[str, int]:
-        """骨架调用：流式低压思考 → 流式常规。
+        """PlanCompiler 调用（第 3 步）：graph-ID + debt-ID 直出规划，流式低压思考 → 流式常规。
 
         kimi-k3-highspeed 在复杂长 prompt 上会把 max_tokens 全烧在 reasoning
         （正文为空）；reasoning_effort=low 实测 ~20s 出稿。参数不被某 provider
@@ -2114,13 +2700,16 @@ class ReadingEngine:
         中段、JSON 围栏整个丢失——显式抬预算；思考型模型（k3 系）reasoning 本身
         就要烧 ~8k token，8192 会挤得正文一个字都出不来，故抬到 16384。
         长输入从第一次调用就使用流式，避免客户端把完整生成时间当成
-        read timeout。每次都执行完整结构验收，两次均不合格则停止发布。
+        read timeout。每次都执行完整结构验收（含直出 ID 真实性）；编造 ID →
+        一次 correction；两次均不合格则抛 ReadingError，由调用方降级继续（不判死）。
         """
         client = client or self.kimi
-        prompt = self.build_skeleton_prompt(paper_md, figures, formulas)
+        prompt = self.build_plan_compile_prompt(
+            paper_md, figures, formulas, graph=graph, registry=registry)
         if workspace:
             cached = workspace.get_text("plan")
-            if cached and not skeleton_output_gaps(cached, evidence):
+            if cached and not skeleton_output_gaps(
+                    cached, evidence, graph=graph, registry=registry):
                 logger.info("教学计划命中检查点")
                 return cached, 0
         attempts = [
@@ -2131,26 +2720,27 @@ class ReadingEngine:
         correction = ""
         for i, (label, kwargs) in enumerate(attempts, 1):
             try:
-                logger.info("骨架调用：%s", label)
+                logger.info("规划调用：%s", label)
                 current_prompt = prompt
                 if correction:
                     current_prompt += (
-                        "\n\n## 上一次骨架未通过验收\n"
-                        f"{correction}\n请重新完整输出，不要省略任何必填章节和 JSON 字段。"
+                        "\n\n## 上一次规划未通过验收\n"
+                        f"{correction}\n请重新完整输出，不要省略任何必填章节和 JSON 字段；"
+                        "node/span/debt ID 只能引用目录与注册表摘要中真实存在的条目。"
                     )
                 out = client.chat(
                     [{"role": "user", "content": current_prompt}],
                     max_tokens=PLANNER_OUTPUT_TOKENS, **kwargs,
                 )
             except KimiParameterError as exc:
-                logger.warning("骨架调用失败（%s）：%s", label, exc)
+                logger.warning("规划调用失败（%s）：%s", label, exc)
                 last_err = exc
                 continue
             except KimiError:
                 # 认证、额度、限流重试耗尽等不是骨架参数问题：立即上报，
                 # 避免同一坏 API 再空跑后续调用方式。
                 raise
-            gaps = skeleton_output_gaps(out, evidence)
+            gaps = skeleton_output_gaps(out, evidence, graph=graph, registry=registry)
             if not gaps:
                 _, skeleton_data = extract_json_block(out)
                 known_formulas = {normalize_formula_label(asset.label) for asset in formulas}
@@ -2168,7 +2758,7 @@ class ReadingEngine:
                     workspace.put_text("plan", out)
                 return out, i
             correction = "；".join(gaps)
-            logger.warning("骨架验收失败（%s）：%s", label, correction)
+            logger.warning("规划验收失败（%s）：%s", label, correction)
         detail = correction or str(last_err or "未知错误")
         raise ReadingError(f"骨架连续两次未通过教学验收：{detail}")
 
@@ -2186,12 +2776,24 @@ class ReadingEngine:
         workspace: Any,
         progress: Callable[[str], None],
         evidence_chunks: set[str] | None = None,
+        debt_registry: Any | None = None,
     ) -> tuple["ReadingPlan", Any, dict[str, Any]]:
-        """Plan Reviewer 四状态循环：clean 放行；repairable 走 RepairEngine；
-        unsupported_repair 转有界局部重规划（一次）；blocked 标记后止步。
-        Reviewer 输出格式/版本错误只重试 Reviewer，绝不重跑 Planner。
-        审核侧任何故障（KimiError/连续非法输出/修复空转）口径统一：
-        标注 + 返回当前 Plan 继续，绝不判死。"""
+        """PlanAuditor 四状态循环（V8 第 5 步：确定性准入 + boundary 门禁）：
+
+        - clean 程序门禁：逐 boundary outcome=pass（fail/unknown 不得 clean）、
+          单层核心主张准入、债务归属/preparations/purpose·mode 各一条且 pass；
+          缺项/不合格 → 一次格式纠正 → 仍不合格标注「语义准入审核不完整」继续；
+          准入通过时把逐 boundary 判定写回 plan.boundaries 落盘可审计。
+        - boundary fail：reviewer 按协议走 repairable（带 replace 建议）或
+          unsupported_repair（需 merge/split）通道，程序不为 fail 开 clean 口子。
+        - repairable：RepairEngine 有界修复，修后必重审（含格式纠正通道修复，
+          统一回环）；继续条件三选一（issue 集合或最高严重度下降 / plan digest
+          实际变化 / 无重复相同 action），全不满足熔断标注。
+        - unsupported_repair：有界局部重规划（一次），仍不行标注继续。
+        预算：一次格式纠正（JSON 非法/协议违反/checks 不完整共用）+ 最多两轮
+        语义修复。Reviewer 输出错误只重试 Reviewer，绝不重跑 Planner；
+        审核侧任何故障口径统一：标注 + 返回当前 Plan 继续，绝不判死。"""
+        from .reading_issues import validate_review_outcome
         from .reading_repair import RepairAction, RepairEngine, RepairRejected
 
         def _call_reviewer(correction: str = "") -> dict[str, Any]:
@@ -2222,46 +2824,69 @@ class ReadingEngine:
             sk, _ = p.to_skeleton()
             return sk
 
+        ledger = self._ledger()
+
+        def _register_plan_issues(review: dict[str, Any]) -> None:
+            # 第 4 步：reviewer 输出归一进 IssueLedger（幂等去重，落盘可审计）
+            self._ledger_register_review(review, stage="plan", workspace=workspace)
+
+        def _open_plan_ids() -> list[str]:
+            return [issue.issue_id for issue in ledger.open_issues(stage="plan")]
+
         def _annotate_and_return(marker: str) -> tuple["ReadingPlan", Any, dict[str, Any]]:
+            # 批注交付路径：遗留 open 的 Plan issue 带原因降级（禁静默丢失）
+            self._ledger_degrade(_open_plan_ids(), marker, workspace)
             plan.meta.setdefault("issues", []).append(marker)
             return plan, *plan.to_skeleton()
 
-        retries = 0
-        replan_used = 0  # 每 Plan 最多一次局部重规划
-        repair_rounds = 0  # repairable 总轮次上限（合法 repair 也不得无限空转）
+        def _accept_clean() -> tuple["ReadingPlan", Any, dict[str, Any]]:
+            # clean 放行：此前 repairable/unsupported 轮次的 open issue 视为已偿还
+            self._ledger_resolve(_open_plan_ids(), "plan-review:clean", workspace)
+            return plan, *plan.to_skeleton()
+
+        def _review_unavailable_return(reason: str) -> tuple["ReadingPlan", Any, dict[str, Any]]:
+            # review_unavailable：无修复路由（route 为 None），入册后走标注交付
+            self._ledger_register_review(
+                {"tier": "review_unavailable",
+                 "issues": [{"severity": "中",
+                             "problem": "Plan 审核服务不可用，未经完整审核"}]},
+                stage="plan", workspace=workspace)
+            return _annotate_and_return("Plan 审核不可用 review_unavailable：" + reason)
+
+        format_budget = 1      # 全流程共用的一次格式纠正（JSON 非法/协议违反/checks 不完整）
+        replan_used = 0        # 每 Plan 最多一次局部重规划
+        repair_rounds = 0      # 语义修复轮次（合法 repair 也不得无限空转）
+        prev_issue_sig: frozenset[str] | None = None  # 上一轮 repairable 的 issue 身份集合
+        prev_max_sev = 0                              # 上一轮 repairable 的最高严重度
+        seen_action_sigs: set[str] = set()            # 已执行修复动作签名（重复动作熔断）
+        correction = ""
         while True:
             try:
-                review = _call_reviewer()
+                review = _call_reviewer(correction)
+                correction = ""
+                _register_plan_issues(review)
                 status = str(review.get("status") or "").strip()
                 if status == "review_unavailable":
                     # 产出优先：与 blocked 同语义——标注后继续用当前 Plan
                     logger.warning("Plan 审核不可用（review_unavailable，标注继续）")
-                    return _annotate_and_return(
-                        "Plan 审核不可用 review_unavailable："
-                        + str(review.get("reason") or ""))
+                    return _review_unavailable_return(str(review.get("reason") or ""))
                 if status == "clean":
+                    outcome_gaps = validate_review_outcome(
+                        status, review.get("checks"), review.get("issues"),
+                        review.get("repairs"))
                     if review.get("repairs"):
-                        raise RepairRejected("clean 状态不得携带 repairs")
-                    check_gaps = _plan_review_check_gaps(review.get("checks"), plan, source)
+                        raise RepairRejected(
+                            "；".join(outcome_gaps) or "clean 状态不得携带 repairs")
+                    # 第 5 步准入：统一一致性校验 + boundary/单层/债务门禁合并
+                    check_gaps = outcome_gaps + _plan_review_check_gaps(
+                        review.get("checks"), plan, source,
+                        graph=graph, registry=debt_registry)
                     if check_gaps:
-                        # 语义准入举证不完整 = reviewer 输出不完整：correction 重试一次
-                        logger.warning("Plan 审核 checks 不合格（带修正重试一次）：%s",
-                                       "；".join(check_gaps[:3]))
-                        retry_review = _call_reviewer(
-                            "checks 不合格：" + "；".join(check_gaps[:6]))
-                        retry_status = str(retry_review.get("status") or "").strip()
-                        if retry_status == "clean" and not retry_review.get("repairs"):
-                            retry_gaps = _plan_review_check_gaps(
-                                retry_review.get("checks"), plan, source)
-                        else:
-                            retry_gaps = ["重试后仍未给出合格的 clean 审核"]
-                        if retry_gaps:
-                            # 仍不合格 → 标注 degraded 继续，绝不判死
-                            logger.warning("语义准入审核不完整（标注继续）：%s",
-                                           "；".join(retry_gaps[:3]))
-                            plan.meta.setdefault("issues", []).append(
-                                "语义准入审核不完整：" + "；".join(retry_gaps[:4]))
-                    return plan, *plan.to_skeleton()
+                        # 语义准入举证不完整 = reviewer 输出不完整：走格式纠正
+                        raise _PlanChecksIncomplete("；".join(check_gaps[:6]))
+                    # 准入通过：逐 boundary 判定写回 plan.boundaries（落盘可审计）
+                    _plan_merge_boundary_outcomes(plan, review.get("checks"))
+                    return _accept_clean()
                 if status == "blocked":
                     # 产出优先：标记后继续（证据不足不阻断已生成的 Plan）
                     logger.warning("Plan 审核 blocked（标记继续）：%s",
@@ -2286,76 +2911,80 @@ class ReadingEngine:
                     try:
                         plan = self._local_replan(
                             plan, graph, review, planner_client, paper_md, workspace,
-                            evidence_chunks=evidence_chunks)
-                    except ReadingError as replan_exc:
-                        # 产出优先：重规划失败不杀，标注后继续用当前 Plan
-                        logger.warning("局部重规划失败（标注继续）：%s", replan_exc)
+                            evidence_chunks=evidence_chunks, registry=debt_registry)
+                    except (ReadingError, KimiError) as replan_exc:
+                        # 产出优先：重规划失败（含 Planner KimiError，第 8 步收口）
+                        # 不杀——旧 Plan 未被改动（_local_replan 克隆内工作），标注后继续
+                        logger.warning("局部重规划失败（回滚旧 Plan，标注继续）：%s",
+                                       replan_exc)
                         return _annotate_and_return(f"局部重规划失败：{replan_exc}")
                     continue
                 if status == "repairable":
-                    repair_rounds += 1
-                    if repair_rounds > 6:
-                        # 产出优先：修复轮次有界——超限标注返回，不无限烧 token
-                        logger.warning("Plan 修复超过 6 轮仍未 clean（标注继续）")
-                        return _annotate_and_return(
-                            "Plan 修复超过 6 轮仍未 clean（degraded 继续）")
                     actions = [RepairAction.from_dict(a)
                                for a in (review.get("repairs") or [])]
-                    engine = RepairEngine(graph, evidence_chunks=evidence_chunks)
+                    sigs = [_plan_action_sig(a) for a in actions]
+                    issue_sig, max_sev = _plan_review_issue_sig(review)
+                    if prev_issue_sig is not None and issue_sig == prev_issue_sig \
+                            and max_sev >= prev_max_sev \
+                            and all(sig in seen_action_sigs for sig in sigs):
+                        # 继续条件三选一全不满足：issue 未降 / 动作全重复
+                        # （digest 未变由下方 no-op 熔断覆盖）→ 熔断不空转烧 token
+                        logger.warning("Plan 修复无实质进展（issue 未降/动作重复，标注继续）")
+                        return _annotate_and_return(
+                            "Plan 修复无实质进展（issue 未降/动作重复，标注继续）")
+                    repair_rounds += 1
+                    if repair_rounds > PLAN_MAX_REPAIR_ROUNDS:
+                        # 产出优先：语义修复预算有界——超限标注返回，不无限烧 token
+                        logger.warning("Plan 修复超过 %d 轮仍未 clean（标注继续）",
+                                       PLAN_MAX_REPAIR_ROUNDS)
+                        return _annotate_and_return(
+                            f"Plan 修复超过 {PLAN_MAX_REPAIR_ROUNDS} 轮仍未 clean"
+                            "（语义修复预算耗尽，degraded 继续）")
+                    engine = RepairEngine(graph, evidence_chunks=evidence_chunks,
+                                          registry=debt_registry)
                     new_plan, stats = engine.apply(plan, actions)
                     if workspace:
                         workspace.put_json("plan-json", new_plan.to_dict())
+                        if stats.registry is not None:
+                            # 修复改变债务归属时（如 replace_plan_fragment）：
+                            # owner 重绑后的注册表随 Plan 原子落盘
+                            workspace.put_json("debt-registry",
+                                               stats.registry.to_dict())
                     logger.info("Plan 修复：%d 操作，影响 %d 单元，新 plan_revision=%d",
                                 stats.applied, len(stats.changed_units),
                                 new_plan.plan_revision)
                     plan = new_plan
-                    if not stats.changed_units:
-                        # no-op 熔断：修复无实质变化，不再 continue 空转烧 token
+                    if not stats.changed_units and not stats.created \
+                            and not stats.retired:
+                        # no-op 熔断：修复无实质变化（plan digest 未变且无拓扑变化），不再空转
                         logger.warning("Plan 修复无实质变化（no-op 熔断，标注继续）")
                         return _annotate_and_return(
                             "Plan 修复无实质变化（no-op 熔断，标注继续）")
-                    continue  # 修复后再审一次
+                    seen_action_sigs.update(sigs)
+                    prev_issue_sig, prev_max_sev = issue_sig, max_sev
+                    continue  # 修后必重审（含格式纠正通道的修复，统一回环）
                 raise RepairRejected(f"非法状态：{status or '缺失'}")
+            except _PlanChecksIncomplete as exc:
+                if format_budget:
+                    format_budget -= 1
+                    correction = "checks 不合格：" + str(exc)
+                    logger.warning("Plan 审核 checks 不合格（带修正重试一次）：%s", exc)
+                    continue
+                # 纠正后仍不合格 → 标注 degraded 继续，绝不判死
+                logger.warning("语义准入审核不完整（标注继续）：%s", exc)
+                marker = "语义准入审核不完整：" + str(exc)[:200]
+                plan.meta.setdefault("issues", []).append(marker)
+                self._ledger_degrade(_open_plan_ids(), marker, workspace)
+                return plan, *plan.to_skeleton()
             except (RepairRejected, json.JSONDecodeError, ValueError) as exc:
-                retries += 1
-                if retries > 2:
-                    # 产出优先：审核输出连续非法不判死——标注 degraded 返回当前 Plan
-                    logger.warning("Plan 审核重试耗尽（degraded 继续）：%s", exc)
-                    return _annotate_and_return(f"Plan 审核重试耗尽（degraded 继续）：{exc}")
-                logger.warning("Plan Reviewer 输出被拒（第 %d 次）：%s", retries, exc)
-                try:
-                    review = _call_reviewer(str(exc))
-                    status = str(review.get("status") or "").strip()
-                    if status == "review_unavailable":
-                        logger.warning("Plan 审核不可用（review_unavailable，标注继续）")
-                        return _annotate_and_return(
-                            "Plan 审核不可用 review_unavailable："
-                            + str(review.get("reason") or ""))
-                    if status == "clean":
-                        if review.get("repairs"):
-                            raise RepairRejected("clean 状态不得携带 repairs")
-                        check_gaps = _plan_review_check_gaps(
-                            review.get("checks"), plan, source)
-                        if check_gaps:
-                            # 重试后 checks 仍不合格：标注继续（不再消耗重试）
-                            logger.warning("语义准入审核不完整（标注继续）：%s",
-                                           "；".join(check_gaps[:3]))
-                            plan.meta.setdefault("issues", []).append(
-                                "语义准入审核不完整：" + "；".join(check_gaps[:4]))
-                        return plan, *plan.to_skeleton()
-                    if status == "repairable":
-                        actions = [RepairAction.from_dict(a)
-                                   for a in (review.get("repairs") or [])]
-                        engine = RepairEngine(graph, evidence_chunks=evidence_chunks)
-                        plan, stats = engine.apply(plan, actions)
-                        if workspace:
-                            workspace.put_json("plan-json", plan.to_dict())
-                        return plan, *plan.to_skeleton()
-                    raise RepairRejected(f"重试后状态仍非法：{status}")
-                except (RepairRejected, json.JSONDecodeError, ValueError) as exc2:
-                    # 产出优先：同上——标注 degraded 返回当前 Plan，不动 Plan
-                    logger.warning("Plan 审核重试耗尽（degraded 继续）：%s", exc2)
-                    return _annotate_and_return(f"Plan 审核重试耗尽（degraded 继续）：{exc2}")
+                if format_budget:
+                    format_budget -= 1
+                    correction = str(exc)
+                    logger.warning("Plan Reviewer 输出被拒（格式纠正一次）：%s", exc)
+                    continue
+                # 产出优先：审核输出连续非法不判死——标注 degraded 返回当前 Plan
+                logger.warning("Plan 审核重试耗尽（degraded 继续）：%s", exc)
+                return _annotate_and_return(f"Plan 审核重试耗尽（degraded 继续）：{exc}")
 
     def _local_replan(
         self,
@@ -2366,11 +2995,13 @@ class ReadingEngine:
         source: str,
         workspace: Any,
         evidence_chunks: set[str] | None = None,
+        registry: Any | None = None,
     ) -> "ReadingPlan":
         """有界局部重规划：只重出受影响单元的合同，合并后完整校验。
         v1 简化：用骨架规划器对受影响区域重出字段（unit_id 保留，身份不动）。
         source 为论文原文（paper_md）：锚点偏移基于它，scope 内的 source spans
-        从这里截取。"""
+        从这里截取。registry 为 Canonical DebtRegistry（第 5 步接线）：修复后
+        校验与 boundary 重算都要感知债务归属。"""
         from .reading_plan import ReadingPlan, validate_plan
 
         # 显式 target_ids：Reviewer 必须给稳定 unit_id，不做层名/标题模糊匹配
@@ -2473,7 +3104,8 @@ class ReadingEngine:
             for key, value in fixed.items():
                 if key not in forbidden and key in unit.data:
                     unit.data[key] = value
-        gaps = validate_plan(work, graph, evidence_chunks=evidence_chunks)
+        gaps = validate_plan(work, graph, evidence_chunks=evidence_chunks,
+                             registry=registry)
         if gaps:
             raise ReadingError("局部重规划后 Plan 不变量未通过：" + "；".join(gaps))
         # digest 重算；仅当任一受影响单元 digest 实际变化才递增 plan_revision
@@ -2487,96 +3119,15 @@ class ReadingEngine:
             any_changed = any_changed or sem_changed or disp_changed
         if any_changed:
             work.plan_revision += 1
+        # 重规划可能改写 debt_ids/source_span_ids：boundary 交集按新合同确定性重算
+        # （outcome 复位 unknown，由回环后的重审重新判定）
+        work.precompute_boundaries()
         if workspace:
             workspace.put_json("plan-json", work.to_dict())
         return work
-    # ---- [V7.1 清理] 已停用：V3 骨架语义审核，生产已改用 _review_plan_and_repair。经全项目核对生产链路零引用，保留备查 ----
-    # def _review_skeleton_semantic(
-    #     self,
-    #     client: Any,
-    #     skeleton_out: str,
-    #     source: str,
-    #     chunk_ids: set[str] | None = None,
-    # ) -> list[str]:
-    #     """骨架语义审核（正文动工前）：审核器带原文证据裁决断链声明真实性、
-    #     preparations 重复建立/欠分配/下放错误、purpose·mode 举证分流。
-    #     fail-closed：非法 JSON 修正重试后仍异常按未通过处理；pass=true 必须
-    #     携带非空、非套话、带来源的 checks 明细，否则不予通过。"""
-    #     _, skeleton_data = extract_json_block(skeleton_out)
-    #     prompt = _render(
-    #         _load(self.prompts_dir / "reading_skeleton_review.md"),
-    #         SOURCE_CONTENT=source,
-    #         SKELETON_JSON=json.dumps(skeleton_data, ensure_ascii=False, indent=2),
-    #     )
-    #     raw = client.chat(
-    #         [{"role": "user", "content": prompt}],
-    #         heavy=True, json_mode=True, low_reasoning=True,
-    #         max_tokens=LOCAL_REVIEW_OUTPUT_TOKENS,
-    #     )
-    #     review: dict[str, Any] | None = None
-    #     for _attempt in range(2):
-    #         try:
-    #             review = _json_object(raw)
-    #             break
-    #         except (json.JSONDecodeError, ValueError):
-    #             raw = client.chat(
-    #                 [{"role": "user", "content": (
-    #                     prompt + "\n\n## 本次必须修正\n"
-    #                     "上一次输出无法解析为 JSON。只输出一个 JSON 对象，不要任何解释、"
-    #                     "前后缀或 markdown 围栏。"
-    #                 )}],
-    #                 heavy=True, json_mode=True, low_reasoning=True,
-    #                 max_tokens=LOCAL_REVIEW_OUTPUT_TOKENS,
-    #             )
-    #     if review is None:
-    #         # 末次重试的结果同样要解析：直接丢弃会白烧一次调用还误判未通过
-    #         try:
-    #             review = _json_object(raw)
-    #         except (json.JSONDecodeError, ValueError):
-    #             review = None
-    #     if review is None:
-    #         # fail-closed：审核输出两轮仍非法 → 视为本轮规划未通过（进入有界重试）
-    #         logger.warning("骨架语义审核连续非法 JSON，按未通过处理")
-    #         return ["骨架语义审核输出异常（连续非法 JSON），请保持字段完整重出骨架"]
-    #     issues_raw = review.get("issues") or []
-    #     checks = review.get("checks")
-    #     # pass=true 但携带问题：矛盾输出按问题处理，不得直接放行
-    #     if _review_bool(review.get("pass")) is True and not issues_raw:
-    #         # 程序级举证门禁：逐层覆盖/必需检查项/evidence 可追溯，全部 fail-closed
-    #         return _skeleton_review_check_gaps(
-    #             checks, skeleton_data, chunk_ids, source,
-    #         )
-    #     gaps: list[str] = []
-    #     for item in issues_raw:
-    #         if not isinstance(item, dict):
-    #             continue
-    #         problem = str(item.get("problem") or "").strip()
-    #         if not problem:
-    #             continue
-    #         kind = str(item.get("kind") or "")
-    #         location = str(item.get("location") or "")
-    #         action = str(item.get("action") or "").strip()
-    #         gaps.append(
-    #             f"[{kind}]{location}：{problem}" + (f"（动作：{action}）" if action else "")
-    #         )
-    #     return gaps or ["骨架语义审核未通过但未说明具体问题"]
 
     # ---- 主流程 ----
 
-    @staticmethod
-    def _merge_continuity(state: dict[str, Any], review: dict[str, Any]) -> None:
-        update = review.get("continuity_update")
-        if not isinstance(update, dict):
-            return
-        for key in ("defined_terms", "established_claims", "open_questions"):
-            values = update.get(key)
-            if not isinstance(values, list):
-                continue
-            target = state.setdefault(key, [])
-            for value in values:
-                text = str(value).strip()
-                if text and text not in target:
-                    target.append(text)
 
     @staticmethod
     def _local_review_passed(review: Any) -> bool:
@@ -2621,6 +3172,656 @@ class ReadingEngine:
         ]
         return "；".join(details[:8]) or "审核未说明具体问题"
 
+    # ---- V8 第 4 步：IssueLedger 接线（统一 ReviewIssue 归一 + 终态收口）----
+    # 只记录与收口，不改任何审核判定逻辑；判定改造在第 5/6 步。
+
+    def _ledger(self) -> Any:
+        from .reading_issues import IssueLedger
+        if self._issue_ledger is None:
+            self._issue_ledger = IssueLedger()
+        return self._issue_ledger
+
+    def _ledger_load(self, workspace: Any) -> None:
+        """run() 起点加载台账：schema 兼容则续用（恢复/返工不丢历史），否则重开。"""
+        from .reading_issues import IssueLedger
+        ledger = IssueLedger()
+        if workspace is not None:
+            raw = workspace.get_json("issue-ledger")
+            if isinstance(raw, dict):
+                try:
+                    ledger = IssueLedger.from_dict(raw)
+                except ValueError:
+                    logger.warning("issue-ledger schema 不兼容，重开新台账")
+        self._issue_ledger = ledger
+
+    def _ledger_persist(self, workspace: Any) -> None:
+        if workspace is not None:
+            workspace.put_json("issue-ledger", self._ledger().to_dict())
+
+    def _ledger_register_review(self, review: Any, *, stage: str,
+                                target_ids: Iterable[str] = (),
+                                workspace: Any = None) -> list[str]:
+        """审核器出口归一：自由 issues 经 from_legacy 进 IssueLedger（幂等去重）并落盘。
+        review_unavailable 口径以对应 kind 入册（无修复路由，走标注交付）。"""
+        from .reading_issues import ReviewIssue
+        if not isinstance(review, dict):
+            return []
+        unavailable = (str(review.get("tier") or "") == "review_unavailable"
+                       or bool(review.get("review_unavailable")))
+        issues = [
+            ReviewIssue.from_legacy(
+                item, stage,
+                kind_override="review_unavailable" if unavailable else None,
+                default_target_ids=target_ids)
+            for item in (review.get("issues") or [])
+            if isinstance(item, dict)
+        ]
+        if unavailable and not issues:
+            # 终审等 unavailable 协议 issues 为空：合成一条入册（标注交付，重写 0 次）
+            issues = [ReviewIssue.from_legacy(
+                {"severity": "中", "problem": "审核服务不可用，未经完整审核"},
+                stage, kind_override="review_unavailable",
+                default_target_ids=target_ids)]
+        ids = self._ledger().register(issues)
+        if issues:
+            self._ledger_persist(workspace)
+        return ids
+
+    def _ledger_resolve(self, issue_ids: Iterable[str], by: str,
+                        workspace: Any = None) -> None:
+        """幂等收口：只对仍 open 的入册 issue 置 resolved（重复调用安全）。"""
+        ledger = self._ledger()
+        open_ids = {issue.issue_id for issue in ledger.open_issues()}
+        ids = [iid for iid in dict.fromkeys(issue_ids) if iid in open_ids]
+        if ids:
+            ledger.mark_resolved(ids, by)
+            self._ledger_persist(workspace)
+
+    def _ledger_degrade(self, issue_ids: Iterable[str], reason: str,
+                        workspace: Any = None) -> None:
+        """幂等收口：只对仍 open 的入册 issue 置 degraded_with_reason（带原因批注）。"""
+        ledger = self._ledger()
+        open_ids = {issue.issue_id for issue in ledger.open_issues()}
+        ids = [iid for iid in dict.fromkeys(issue_ids) if iid in open_ids]
+        if ids:
+            ledger.mark_degraded(ids, reason)
+            self._ledger_persist(workspace)
+
+    def _gate_review(self, review: Any, *, unit_id: str,
+                     workspace: Any = None) -> bool:
+        """局审闸门（第 4 步接线）：先把审核 issues 归一进台账（幂等），再按原口径判定。"""
+        self._ledger_register_review(review, stage="unit", target_ids=[unit_id],
+                                     workspace=workspace)
+        return self._local_review_passed(review)
+
+    def _close_unit_issues(self, unit_id: str, *, passed: bool, review: Any,
+                           label: str, workspace: Any = None) -> None:
+        """单元审核循环出口的终态收口（禁静默丢失）：
+        - 多轮未过 → 该单元全部 open issue 置 degraded（批注交付）；
+        - 通过 → 早前轮次已修复的置 resolved；本轮携带的中低严重度意见按局审口径
+          放行（随终审独立复核）置 degraded；review_unavailable 标注交付置 degraded。"""
+        ledger = self._ledger()
+        open_unit = [issue for issue in ledger.open_issues(stage="unit")
+                     if unit_id in issue.target_ids]
+        if not open_unit:
+            return
+        if not passed:
+            self._ledger_degrade(
+                [issue.issue_id for issue in open_unit],
+                f"「{label}」多轮审核未过，全文保留加批注交付", workspace)
+            return
+        current_ids = set(self._ledger_register_review(
+            review, stage="unit", target_ids=[unit_id], workspace=workspace))
+        fixed = [issue.issue_id for issue in open_unit
+                 if issue.issue_id not in current_ids]
+        carried = [issue for issue in open_unit if issue.issue_id in current_ids]
+        self._ledger_resolve(fixed, f"unit-review:pass:{unit_id}", workspace)
+        self._ledger_degrade(
+            [issue.issue_id for issue in carried if issue.kind == "review_unavailable"],
+            "审核不可用，按 review_unavailable 口径标注交付（重写 0 次）", workspace)
+        self._ledger_degrade(
+            [issue.issue_id for issue in carried if issue.kind != "review_unavailable"],
+            "中低严重度意见按局审口径放行，随终审独立复核", workspace)
+
+    # ---- V8 第 6 步：block manifest + root_scope 分流 + plan/graph 回流 ----
+
+    @staticmethod
+    def _parse_review_issues(review: Any, *, stage: str,
+                             default_target_ids: Iterable[str] = ()) -> list[Any]:
+        """审核器自由 issues → ReviewIssue 列表（from_legacy 归一；非法项跳过不判死）。"""
+        from .reading_issues import ReviewIssue
+        out: list[Any] = []
+        for item in (review.get("issues") or []) if isinstance(review, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                out.append(ReviewIssue.from_legacy(
+                    item, stage, default_target_ids=default_target_ids))
+            except ValueError:
+                continue
+        return out
+
+    def _unit_blocks(self, unit_id: str, content: str, workspace: Any,
+                     registry: Any, graph: Any) -> tuple[Any, str]:
+        """计算并落盘单元 block manifest（workspace key `blocks-{unit_id}`），
+        返回 (manifest, 注入 block 标记的审核稿)。审核稿只给审核器看，
+        发布稿始终取未标注正文。"""
+        from .reading_blocks import render_for_review, split_blocks
+        manifest = split_blocks(unit_id, content, registry=registry, graph=graph)
+        if workspace is not None:
+            workspace.put_json(f"blocks-{unit_id}", manifest.to_dict())
+        return manifest, render_for_review(content, manifest)
+
+    def _delete_issue_blocks(self, review: Any, *, unit_id: str, content: str,
+                             registry: Any, graph: Any
+                             ) -> tuple[str, list[dict], str] | None:
+        """root_scope=body 且带 body_block_ids 的 issue → 程序机械删块（零模型调用）。
+
+        只执行删除点真实存在的块（审核器编造的块 ID 一律忽略）；返回
+        (新正文, 合成 edits, 删除点相邻块上下文)；无可执行定位返回 None。"""
+        from .reading_blocks import delete_blocks, deletion_neighbor_context, split_blocks
+        block_ids: list[str] = []
+        for issue in self._parse_review_issues(review, stage="unit",
+                                               default_target_ids=[unit_id]):
+            if issue.root_scope != "body":
+                continue
+            for bid in issue.body_block_ids:
+                if bid not in block_ids:
+                    block_ids.append(bid)
+        if not block_ids:
+            return None
+        manifest = split_blocks(unit_id, content, registry=registry, graph=graph)
+        known = [bid for bid in block_ids if manifest.get(bid) is not None]
+        if not known:
+            return None
+        new_content = delete_blocks(content, manifest, known)
+        if new_content.strip() == content.strip():
+            return None  # 删除无实质变化（异常防御）
+        edits = [{"find": (manifest.get(bid).text[:80] if manifest.get(bid) else bid),
+                  "replace": ""} for bid in known]
+        context = deletion_neighbor_context(manifest, known)
+        return new_content, edits, context
+
+    # ---- V8 第 8 步：ContinuityLedger（真实 term/claim/state 依赖）----
+
+    @staticmethod
+    def _unit_continuity_pack(unit_id: str, *, plan: Any, ledger: Any,
+                              registry: Any, graph: Any
+                              ) -> tuple[dict[str, Any], list[tuple[str, int]]]:
+        """Writer 装包：只注入与本单元有真实依赖的 continuity 条目。
+
+        返回（注入 dict, continuity_input_ids=[(entry_id, revision)]）——实际注入
+        什么登记什么；manifest 依赖边与审核侧连续状态都用同一份。"""
+        from .reading_continuity import unit_probe_text
+        unit = plan.units[unit_id]
+        probe = unit_probe_text(unit, plan=plan, registry=registry, graph=graph)
+        return ledger.pack(probe)
+
+    @staticmethod
+    def _invalidate_continuity_consumers(changed: dict[str, int], manifest: Any,
+                                         workspace: Any) -> None:
+        """continuity 条目变化 → 按 manifest 依赖边精准失效消费者检查点。
+        消费者总在建立者之后处理（装包时只能注入已建立条目），循环到达前失效即可。"""
+        if not changed or workspace is None or manifest is None:
+            return
+        dirty = manifest.dirty_closure(
+            {f"continuity:{eid}": rev for eid, rev in changed.items()})
+        targets: set[str] = set(dirty)
+        for artifact in dirty:
+            if artifact.startswith("body-"):
+                uid = artifact[len("body-"):]
+                targets.update({f"review-{uid}", f"blocks-{uid}"})
+        if targets:
+            logger.info("continuity 条目变化（%d 项），精准失效消费者：%s",
+                        len(changed), "、".join(sorted(targets)[:6]))
+            workspace.invalidate_from(tuple(sorted(targets)))
+
+    @staticmethod
+    def _register_unit_continuity(ledger: Any, unit_id: str, review: Any,
+                                  manifest: Any, workspace: Any) -> None:
+        """局审出口的 continuity 登记（未降级才建立；降级/缺失撤下旧条目）并落盘。"""
+        update = review.get("continuity_update") \
+            if isinstance(review, dict) and not review.get("degraded") else None
+        changed = ledger.register_unit(unit_id, update)
+        if workspace is not None:
+            workspace.put_json("continuity-ledger", ledger.to_dict())
+        ReadingEngine._invalidate_continuity_consumers(changed, manifest, workspace)
+
+    def _route_unit_issues(self, review: Any, *, unit_id: str, plan: Any,
+                           registry: Any, graph: Any, planner_client: Any,
+                           paper_md: str, workspace: Any, evidence_chunks: Any,
+                           manifest: Any, progress: Callable[[str], None],
+                           ) -> tuple[bool, Any, list[str]]:
+        """局审失败先按 root_scope 分流（第 6 步）：plan/graph → 回流（committed 时
+        调用方递归重跑）；asset → 只重做对应 figure 讲解；body 留给调用方的正文修复。
+
+        返回 (committed, review, notes)：review 已剔除成功路由/降级的 issue；
+        notes 为需要随正文批注的降级项（plan/graph 回流失败）。"""
+        issues = self._parse_review_issues(review, stage="unit",
+                                           default_target_ids=[unit_id])
+        notes: list[str] = []
+        if not issues:
+            return False, review, notes
+        plan_issues = [i for i in issues
+                       if i.root_scope == "plan" and i.kind != "review_unavailable"]
+        graph_issues = [i for i in issues if i.root_scope == "graph"]
+        asset_issues = [i for i in issues if i.root_scope == "asset"]
+        routed_ids: set[str] = set()
+        for issue in asset_issues:
+            # 只重做对应 figure 讲解：失效检查点，图阶段在单元循环之后重生成
+            labels = [t for t in issue.target_ids if t and t != unit_id]
+            if workspace is not None:
+                for label in labels:
+                    workspace.invalidate_from((f"figure-{label}",))
+            self._ledger_resolve([issue.issue_id], f"asset-routing:{unit_id}", workspace)
+            routed_ids.add(issue.issue_id)
+            logger.info("asset 类问题路由：重做图表讲解 %s（%s）",
+                        "、".join(labels) or "未指明", unit_id)
+        if plan_issues:
+            try:
+                committed, plan_notes = self._attempt_plan_reflux(
+                    plan_issues, plan=plan, registry=registry, graph=graph,
+                    planner_client=planner_client, paper_md=paper_md,
+                    workspace=workspace, evidence_chunks=evidence_chunks,
+                    manifest=manifest, progress=progress,
+                    raw_repairs=(review.get("repairs")
+                                 if isinstance(review, dict) else None))
+            except Exception as exc:  # 产出优先：回流任何异常 → 回滚+批注，绝不判死
+                committed = False
+                plan_notes = [f"plan 类回流异常（已回滚）：{str(exc)[:160]}"]
+                self._ledger_degrade([i.issue_id for i in plan_issues],
+                                     plan_notes[0], workspace)
+            notes.extend(plan_notes)
+            if committed:
+                return True, review, notes
+            routed_ids.update(i.issue_id for i in plan_issues)  # 失败已降级批注
+        if graph_issues:
+            try:
+                g_committed, g_notes = self._attempt_graph_rebind(
+                    graph_issues, unit_id=unit_id, plan=plan, graph=graph,
+                    paper_md=paper_md, workspace=workspace, manifest=manifest)
+            except Exception as exc:  # 产出优先：任何异常 → 批注继续，绝不判死
+                g_committed = False
+                g_notes = [f"graph 类回流异常（已回滚）：{str(exc)[:160]}"]
+                self._ledger_degrade([i.issue_id for i in graph_issues],
+                                     g_notes[0], workspace)
+            notes.extend(g_notes)
+            if g_committed:
+                return True, review, notes
+            routed_ids.update(i.issue_id for i in graph_issues)
+        if routed_ids and isinstance(review, dict):
+            # 已路由/降级的 issue 从本轮 review 剔除：剩余 issue 走正文修复路径
+            remaining: list[dict] = []
+            for item in (review.get("issues") or []):
+                if not isinstance(item, dict):
+                    continue
+                parsed = self._parse_review_issues(
+                    {"issues": [item]}, stage="unit", default_target_ids=[unit_id])
+                if parsed and parsed[0].issue_id in routed_ids:
+                    continue
+                remaining.append(item)
+            review = {**review, "issues": remaining}
+            if not remaining:
+                # 阻塞项全部完成路由（降级项已随 notes 批注）：不再进正文修复
+                review["pass"] = True
+        return False, review, notes
+
+    def _attempt_plan_reflux(self, issues: list[Any], *, plan: Any, registry: Any,
+                             graph: Any, planner_client: Any, paper_md: str,
+                             workspace: Any, evidence_chunks: Any, manifest: Any,
+                             progress: Callable[[str], None],
+                             raw_repairs: Any = None,
+                             ) -> tuple[bool, list[str]]:
+        """plan 类 issue 回流：债务归属修复（DebtRepairEngine）、replace_plan_fragment
+        拓扑事务（第 7 步）或 _local_replan 一次。
+
+        通道（产出优先，绝不判死）：克隆 → 应用 → validate_plan 轻量复核 →
+        原子提交落盘；任何一步失败回滚（克隆丢弃，旧 Plan/Registry 字节不变）
+        + ledger degraded + 批注 notes。成功时：bind_debt_owners 重绑 →
+        plan_revision 按 digest 变化递增 → boundary 重算 → 受影响单元
+        （新旧 owner + manifest dirty_closure）精准失效 → issue resolved →
+        调用方递归重跑（只重新生成受影响单元，其余正文不碰）。
+        replan 分支第 7 步起：issue 带 merge/split 语义（kind 为
+        contract_gap/debt_uncovered/boundary_fail 且 target_ids ≥2，或审核器
+        经 raw_repairs 显式给出 fragment payload）时优先 replace_plan_fragment
+        事务，被拒再退 _local_replan 一次，再失败批注。
+        预算：全局每篇 ≤ PLAN_REFLUX_MAX 次；同动作签名熔断。"""
+        from .reading_debts import DebtRepairAction, DebtRepairEngine
+        from .reading_debts import RepairRejected as DebtRepairRejected
+        from .reading_issues import IssueRouteError, route
+        from .reading_plan import ReadingPlan, depends_on_closure, validate_plan
+        from .reading_repair import RepairAction as PlanRepairAction
+        from .reading_repair import RepairEngine as PlanRepairEngine
+        from .reading_repair import RepairRejected as PlanRepairRejected
+
+        notes: list[str] = []
+        plan_issues = [i for i in issues
+                       if i.root_scope == "plan" and i.kind != "review_unavailable"]
+        if not plan_issues or workspace is None:
+            return False, notes
+
+        def _bail(reason: str) -> tuple[bool, list[str]]:
+            self._ledger_degrade([i.issue_id for i in plan_issues], reason, workspace)
+            logger.warning("plan 类回流未执行（回滚+批注继续）：%s", reason)
+            return False, [reason]
+
+        if self._reflux_count >= PLAN_REFLUX_MAX:
+            return _bail(f"plan 类回流全局预算耗尽（{PLAN_REFLUX_MAX} 次/篇），标注继续")
+
+        debts = getattr(registry, "debts", None) or {}
+        layer_uids = [uid for uid in plan.order.get("layers") or []
+                      if uid in plan.units]
+
+        def _owners(did: str) -> list[str]:
+            return [uid for uid in layer_uids
+                    if did in (plan.units[uid].data.get("debt_ids") or [])]
+
+        # ---- ① 债务归属动作（canonicalize/reassign）；② 其余 plan 类 → 局部重规划 ----
+        debt_actions: list[Any] = []
+        debt_edits: dict[str, list[str]] = {}   # uid → 修复后的 debt_ids
+        replan_targets: list[str] = []
+        actioned_issues: list[Any] = []
+        replan_issues: list[Any] = []
+
+        def _edit(uid: str, remove: Iterable[str] = (), add: Iterable[str] = ()) -> None:
+            # 注意空列表也是有效编辑结果（不得用 or 回退到 plan 原值）
+            current = list(debt_edits[uid] if uid in debt_edits
+                           else plan.units[uid].data.get("debt_ids") or [])
+            current = [d for d in current if d not in set(remove)]
+            for did in add:
+                if did not in current:
+                    current.append(did)
+            debt_edits[uid] = current
+
+        for issue in plan_issues:
+            try:
+                ops = route(issue) or ()
+            except IssueRouteError:
+                ops = ()
+            dids = [d for d in issue.debt_ids if d in debts]
+            acted = False
+            if dids and any(op in ("canonicalize_debt", "reassign_debt_owner")
+                            for op in ops):
+                if issue.kind == "debt_duplicated" and len(dids) >= 2:
+                    # 两 debt 实同：机械合并（保留第一条，退休其余，引用重定向）；
+                    # 重定向后归属收束到顺序首 owner（其余层移除，保持唯一归属）
+                    keep, retire = dids[0], dids[1:]
+                    debt_actions.append(DebtRepairAction(
+                        op="canonicalize_debt",
+                        expected_registry_revision=registry.registry_revision,
+                        params={"keep_debt_id": keep, "retire_debt_ids": retire}))
+                    for uid in layer_uids:
+                        current = plan.units[uid].data.get("debt_ids") or []
+                        if any(d in current for d in retire):
+                            _edit(uid, remove=retire, add=[keep])
+                    keep_owners = [
+                        uid for uid in layer_uids
+                        if keep in (debt_edits[uid] if uid in debt_edits
+                                    else plan.units[uid].data.get("debt_ids") or [])]
+                    for uid in keep_owners[1:]:
+                        _edit(uid, remove=[keep])
+                    acted = True
+                else:
+                    for did in dids:
+                        owners = _owners(did)
+                        if len(owners) > 1:
+                            # 同 debt 双 owner：保留 subject 落在 primary 闭包内的
+                            # 归属层（都不满足时保留顺序首层），其余移除
+                            keep_owner = owners[0]
+                            subject = debts[did].subject_node_id
+                            for uid in owners:
+                                primary = str(plan.units[uid].data.get(
+                                    "primary_assertion_id") or "")
+                                if subject and primary and (
+                                        subject == primary or subject in
+                                        depends_on_closure(graph, primary)):
+                                    keep_owner = uid
+                                    break
+                            debt_actions.append(DebtRepairAction(
+                                op="reassign_debt_owner",
+                                expected_registry_revision=registry.registry_revision,
+                                params={"debt_id": did,
+                                        "owner_layer_id": keep_owner}))
+                            for uid in owners:
+                                if uid != keep_owner:
+                                    _edit(uid, remove=[did])
+                            acted = True
+            if acted:
+                actioned_issues.append(issue)
+            else:
+                replan_issues.append(issue)
+                targets = [t for t in issue.target_ids if t in plan.units]
+                if not targets:
+                    targets = [uid for did in dids for uid in _owners(did)]
+                replan_targets.extend(t for t in targets
+                                      if t not in replan_targets)
+
+        # ---- 第 7 步：merge/split 语义优先 replace_plan_fragment 事务 ----
+        # 条件：全部 replan issue 为 contract_gap/debt_uncovered/boundary_fail 且
+        # 定位目标 ≥2（机械翻译：吸收到首 target），或审核器显式给出 fragment
+        # payload；事务被拒再退 _local_replan 一次，再失败批注
+        fragment_action: Any | None = None
+        if not debt_actions:
+            explicit = _parse_fragment_repairs(raw_repairs, plan.plan_revision)
+            merge_semantics = bool(replan_issues) and all(
+                i.kind in FRAGMENT_REFLUX_KINDS for i in replan_issues)
+            if explicit:
+                fragment_action = explicit[0]
+            elif merge_semantics and len(replan_targets) >= 2:
+                fragment_action = PlanRepairAction(
+                    issue_id="reflux-fragment:" + ",".join(
+                        sorted(i.issue_id for i in replan_issues))[:80],
+                    op="replace_plan_fragment",
+                    target_ids=list(replan_targets),
+                    expected_plan_revision=plan.plan_revision,
+                    params=_mechanical_fragment_params(
+                        replan_issues, replan_targets, plan, debts))
+
+        # 同动作签名熔断（重复回流不空转）
+        if debt_actions:
+            sig_material = [
+                f"{a.op}:{json.dumps(a.params, ensure_ascii=False, sort_keys=True)}"
+                for a in debt_actions]
+        elif fragment_action is not None:
+            sig_material = ["replace_plan_fragment:" + json.dumps(
+                fragment_action.params, ensure_ascii=False, sort_keys=True,
+                default=str)]
+        else:
+            sig_material = [f"_local_replan:{','.join(sorted(replan_targets))}"]
+        sig = "|".join(sig_material)
+        if sig in self._reflux_sigs:
+            return _bail("plan 类回流动作与历史重复（熔断，标注继续）")
+
+        try:
+            if debt_actions:
+                work = ReadingPlan.from_dict(plan.to_dict())  # 克隆
+                new_registry, stats = DebtRepairEngine().apply(
+                    registry, graph, debt_actions)
+                changed_units: list[str] = []
+                for uid, new_dids in debt_edits.items():
+                    unit = work.units[uid]
+                    unit.data["debt_ids"] = new_dids
+                    # must_explain/success_test 程序重派生（Registry 是唯一事实源）
+                    unit.data["must_explain"] = [
+                        new_registry.debts[d].learner_action
+                        for d in new_dids if d in new_registry.debts]
+                    unit.data["success_test"] = [
+                        new_registry.debts[d].success_test
+                        for d in new_dids if d in new_registry.debts]
+                    sem_changed, _ = unit.refresh_digests()
+                    if sem_changed:
+                        changed_units.append(uid)
+                if changed_units:
+                    work.plan_revision += 1
+                final_registry = work.bind_debt_owners(new_registry)  # owner 重绑
+                gaps = validate_plan(work, graph, evidence_chunks=evidence_chunks,
+                                     registry=final_registry)
+                if gaps:
+                    return _bail("回流后 Plan 不变量未通过：" + "；".join(gaps[:4]))
+                # 轻量复核 = 程序 validate 通过（boundary 交集重算，判定待下轮全审）
+                work.precompute_boundaries()
+                work.reviewed_revision = work.plan_revision
+                work.debt_registry_revision = final_registry.registry_revision
+                work.meta.setdefault("issues", []).append(
+                    f"第 6 步正文回流：{stats.applied} 个债务操作，"
+                    f"影响 {len(changed_units)} 单元（boundary 待复核）")
+                final_registry.issues.append(
+                    f"第 6 步正文回流：{stats.applied} 个债务操作"
+                    f"（{'、'.join(a.op for a in debt_actions)}）")
+                workspace.put_json("plan-json", work.to_dict())
+                workspace.put_json("debt-registry", final_registry.to_dict())
+                affected = set(changed_units)
+            else:
+                # 其他 plan 类：第 7 步起 merge/split 语义优先 fragment 事务，
+                # 被拒再退 _local_replan 通道一次（再失败由外层 _bail 批注）
+                if not replan_targets and fragment_action is None:
+                    return _bail("plan 类问题无可定位的回流目标，标注继续")
+                work = None
+                affected: set[str] = set()
+                if fragment_action is not None:
+                    progress("🔧 正文审核回流 Plan（replace_plan_fragment 事务）……")
+                    try:
+                        work, fstats = PlanRepairEngine(
+                            graph, evidence_chunks=evidence_chunks,
+                            registry=registry).apply(plan, [fragment_action])
+                    except PlanRepairRejected as frag_exc:
+                        logger.warning(
+                            "replace_plan_fragment 被拒（退局部重规划一次）：%s",
+                            frag_exc)
+                        work = None
+                    if work is not None:
+                        # 轻量复核 = 程序 validate 通过（boundary 已重算，待下轮全审）
+                        affected = (set(fstats.changed_units) | set(fstats.created)
+                                    | set(fstats.retired))
+                        final_registry = fstats.registry
+                        work.reviewed_revision = work.plan_revision
+                        if final_registry is not None:
+                            work.debt_registry_revision = (
+                                final_registry.registry_revision)
+                            final_registry.issues.append(
+                                f"第 7 步 fragment 回流：{len(fstats.created)} 建/"
+                                f"{len(fstats.retired)} 退（boundary 待复核）")
+                            workspace.put_json("debt-registry",
+                                               final_registry.to_dict())
+                        work.meta.setdefault("issues", []).append(
+                            f"第 7 步 fragment 回流：{len(fstats.created)} 建/"
+                            f"{len(fstats.retired)} 退，影响 {len(affected)} 单元"
+                            "（boundary 待复核）")
+                        workspace.put_json("plan-json", work.to_dict())
+                if work is None:
+                    if not replan_targets:
+                        return _bail(
+                            "plan 类问题无可定位的回流目标（fragment 已被拒），标注继续")
+                    progress("🔧 正文审核回流 Plan（局部重规划一次）……")
+                    work = self._local_replan(
+                        plan, graph,
+                        {"target_ids": replan_targets,
+                         "issues": [i.to_dict() for i in replan_issues]},
+                        planner_client, paper_md, workspace,
+                        evidence_chunks=evidence_chunks, registry=registry)
+                    affected = set(replan_targets)
+            # ---- 精准失效：受影响单元 + manifest dirty_closure ----
+            changed_inputs = {f"plan:{uid}": 0 for uid in affected}  # rev 0 强制失配
+            dirty = manifest.dirty_closure(changed_inputs) if manifest else set()
+            targets: set[str] = set(dirty)
+            for artifact in dirty:
+                if artifact.startswith("body-"):
+                    uid = artifact[len("body-"):]
+                    targets.update({f"review-{uid}", f"blocks-{uid}"})
+            for uid in affected:
+                targets.update({f"body-{uid}", f"review-{uid}", f"blocks-{uid}"})
+            targets.update({"final-review", "final-body"})
+            workspace.invalidate_from(tuple(targets))
+            self._reflux_count += 1
+            self._reflux_sigs.add(sig)
+            resolved = actioned_issues if debt_actions else replan_issues
+            self._ledger_resolve([i.issue_id for i in resolved],
+                                 f"plan-reflux:{sig[:60]}", workspace)
+            notes.append(f"plan 类回流已提交：失效 {len(affected)} 单元"
+                         f"（含依赖闭包 {len(dirty)} 项），递归重跑")
+            logger.warning("plan 类回流提交：影响 %s；精准失效 %d 项",
+                           "、".join(sorted(affected)), len(dirty))
+            progress("⤴ 审核发现 Plan 问题，已回写并局部重生成")
+            return True, notes
+        except (DebtRepairRejected, PlanRepairRejected, ReadingError, KimiError,
+                ValueError) as exc:
+            return _bail(f"回流动作被拒/失败（已回滚）：{str(exc)[:200]}")
+
+    def _attempt_graph_rebind(self, issues: list[Any], *, unit_id: str, plan: Any,
+                              graph: Any, paper_md: str, workspace: Any,
+                              manifest: Any) -> tuple[bool, list[str]]:
+        """graph 类 issue：锚点重定位（rebind_source_spans，每单元有界一次）。
+
+        成功：重绑 supported_by + 落盘图 + plan.graph_revision 同步 +
+        只失效真实消费者（manifest dirty_closure）→ committed（调用方递归）；
+        失败：degraded 批注继续，绝不判死。"""
+        from .reading_graph import GraphError, _span_for_offset, resolve_anchor
+        from .reading_plan import graph_content_revision
+
+        notes: list[str] = []
+        graph_issues = [i for i in issues if i.root_scope == "graph"]
+        if not graph_issues or workspace is None:
+            return False, notes
+        if unit_id in self._graph_rebound or self._reflux_count >= PLAN_REFLUX_MAX:
+            reason = "graph 类回流有界一次已用完或全局预算耗尽，标注继续"
+            self._ledger_degrade([i.issue_id for i in graph_issues], reason, workspace)
+            return False, [reason]
+        self._graph_rebound.add(unit_id)
+        rebound: list[str] = []
+        for issue in graph_issues:
+            node_ids = [n for n in issue.node_ids if n in graph.nodes]
+            if not node_ids:  # 兼容只给 span 的：反查 supported_by 起点节点
+                for sid in issue.source_span_ids:
+                    node_ids.extend(
+                        e.from_id for e in graph.edges
+                        if e.kind == "supported_by" and e.to_id == sid)
+            for nid in dict.fromkeys(node_ids):
+                node = graph.nodes.get(nid)
+                quote = str((node.anchor or {}).get("quote") or "") if node else ""
+                if node is None or not quote:
+                    continue
+                result = resolve_anchor(paper_md, quote)
+                if not result.resolved:
+                    continue
+                node.anchor = {"quote": result.quote, "start": result.start,
+                               "end": result.end, "digest": result.digest}
+                node.unresolved_anchor = False
+                span_id = _span_for_offset(graph.spans, result.start, result.end)
+                if span_id:
+                    graph.edges = [e for e in graph.edges
+                                   if not (e.kind == "supported_by"
+                                           and e.from_id == nid)]
+                    try:
+                        graph.add_edge("supported_by", nid, span_id)
+                    except GraphError:
+                        pass
+                rebound.append(nid)
+        if not rebound:
+            reason = "锚点重定位未决（无可用摘录或低于阈值），标注继续"
+            self._ledger_degrade([i.issue_id for i in graph_issues], reason, workspace)
+            return False, [reason]
+        workspace.put_json("semantic-graph", graph.to_dict())
+        if plan is not None:
+            # plan 的图摘要同步刷新为本次面对的图版本（避免恢复侧误判强制重审）
+            plan.graph_revision = graph_content_revision(graph)
+            workspace.put_json("plan-json", plan.to_dict())
+        dirty = manifest.dirty_closure({f"node:{nid}": 0 for nid in rebound}) \
+            if manifest else set()
+        targets: set[str] = set(dirty)
+        for artifact in dirty:
+            if artifact.startswith("body-"):
+                uid = artifact[len("body-"):]
+                targets.update({f"review-{uid}", f"blocks-{uid}"})
+        targets.update({"final-review", "final-body"})
+        workspace.invalidate_from(tuple(targets))
+        self._reflux_count += 1
+        self._ledger_resolve([i.issue_id for i in graph_issues],
+                             f"graph-rebind:{unit_id}", workspace)
+        notes.append(f"锚点重定位 {len(rebound)} 节点，失效消费者 {len(dirty)} 项")
+        logger.info("graph 类回流提交：重绑 %s；精准失效 %d 项",
+                    "、".join(rebound), len(dirty))
+        return True, notes
+
     def run(
         self,
         paper_md: str,
@@ -2646,6 +3847,13 @@ class ReadingEngine:
         model_calls = 0
         if workspace:
             workspace.ensure_signature(self.workflow_fingerprint())
+        # 第 4 步：统一问题台账加载（恢复/返工续用历史，schema 不兼容重开）
+        self._ledger_load(workspace)
+        # 第 6 步：plan/graph 类回流预算——首跑重置，回流/返工递归继承计数
+        if rework_round == 0 and calls_carry == 0:
+            self._reflux_count = 0
+            self._reflux_sigs = set()
+            self._graph_rebound = set()
         # 任务启动后让 Planner/Writer/Reviewer/Vision 冻结同一个全局选择。
         # 中途手动切换只影响下一项任务，不污染正在生成的文档；每个角色均为单候选。
         if isinstance(self.kimi, KimiClient):
@@ -2716,7 +3924,7 @@ class ReadingEngine:
         from .reading_graph import (
             GraphError, SemanticGraph, build_semantic_graph, validate_graph_for_plan,
         )
-        from .reading_plan import ReadingPlan, validate_plan
+        from .reading_plan import ReadingPlan, graph_content_revision, validate_plan
         try:
             graph, graph_stats = build_semantic_graph(
                 paper_md, evidence, planner_client, self.prompts_dir, workspace=workspace,
@@ -2734,6 +3942,34 @@ class ReadingEngine:
             # 产出优先：图缺口记入 graph_issues 继续（绑定受影响的节点自然减少）
             logger.warning("语义图验收缺口（降级继续）：%s", "；".join(graph_gaps[:4]))
             graph.issues.append({"kind": "validation", "gaps": graph_gaps[:6]})
+
+        # ---- 理解债务：DebtCompiler → DebtAuditor → Canonical DebtRegistry ----
+        # 第 2 步：债务先于分层独立生成/审核；第 3 步：Plan 直接消费 Registry
+        # （debt_ids 直出、must_explain/success_test 程序派生）。
+        # 任何异常路径都不判死：degraded 批注继续。
+        from .reading_debts import DebtAuditor
+        progress("🧾 理解债务编译与准入审核中……")
+        debt_registry, debt_stats = self._compile_debts(
+            graph, planner_material, planner_client, workspace)
+        model_calls += debt_stats.get("compile_calls", 0)
+        audit_report: dict[str, Any] = {}
+        if debt_registry.admission_status == "pending" and debt_registry.debts:
+            try:
+                debt_registry, audit_report = DebtAuditor().audit(
+                    debt_registry, graph, reviewer_client, self.prompts_dir)
+            except Exception as exc:  # 防御兜底：审核侧任何异常不判死
+                logger.warning("债务审核异常（degraded 继续）：%s", exc)
+                debt_registry.admission_status = "degraded"
+                debt_registry.issues.append(f"债务审核异常：{str(exc)[:160]}")
+                audit_report = {"notes": [f"债务审核异常：{str(exc)[:160]}"]}
+            model_calls += int(audit_report.get("audit_calls", 0))
+            debt_stats["notes"].extend(audit_report.get("notes") or [])
+            if workspace:
+                workspace.put_json("debt-registry", debt_registry.to_dict())
+        debt_stats["audit_calls"] = int(audit_report.get("audit_calls", 0))
+        debt_stats["repair_rounds"] = int(audit_report.get("repair_rounds", 0))
+        timer.mark("债务编译")
+
         plan: ReadingPlan | None = None
         if workspace:
             raw_plan = workspace.get_json("plan-json")
@@ -2743,12 +3979,29 @@ class ReadingEngine:
                     logger.info("canonical Plan 命中检查点：plan_revision=%d", plan.plan_revision)
                 except (ValueError, TypeError, KeyError):
                     plan = None
+        # 恢复重审三项条件（第 5 步 PlanAuditor 准入语义的恢复侧）：
+        # ① admission_status=pending（从未完成审核）；② 审核后 Plan 又被改动
+        # （reviewed_revision≠plan_revision）；③ 图内容已变（graph_revision 与
+        # 当前图摘要不符）。任一命中必须重审；三项都吻合的已审 Plan 才接缓存直通。
         plan_needs_review = plan is None
+        if plan is not None and not plan_needs_review:
+            current_graph_revision = graph_content_revision(graph)
+            if plan.admission_status == "pending":
+                plan_needs_review = True
+                logger.info("plan-json 命中但 admission_status=pending：强制重审")
+            elif plan.reviewed_revision != plan.plan_revision:
+                plan_needs_review = True
+                logger.info("plan-json reviewed_revision(%d)≠plan_revision(%d)：强制重审",
+                            plan.reviewed_revision, plan.plan_revision)
+            elif plan.graph_revision != current_graph_revision:
+                plan_needs_review = True
+                logger.info("plan-json graph_revision 与当前图摘要不符：强制重审")
         if plan is None:
             try:
                 skeleton_out, skeleton_calls = self._call_skeleton(
                     planner_material, figures, formulas,
                     client=planner_client, workspace=workspace, evidence=evidence,
+                    graph=graph, registry=debt_registry,
                 )
                 model_calls += skeleton_calls
                 timer.mark("骨架")
@@ -2760,15 +4013,16 @@ class ReadingEngine:
                 try:
                     plan = ReadingPlan.from_skeleton(
                         skeleton, graph, self.workflow_fingerprint()[:16],
-                        meta={"metadata": metadata},
+                        meta={"metadata": metadata}, registry=debt_registry,
                     )
                 except PlanCollisionError as collision:
                     # 有界重规划一次：碰撞信息注入；再碰撞/调用失败/骨架不合格统一
                     # 收敛到下方 except ReadingError 的确定性降级 Plan，绝不判死。
                     # （降级骨架三节 purpose/reason 各异 + 单层，ID seed 唯一不自碰撞）
                     logger.warning("Plan ID 碰撞，有界重规划一次：%s", collision)
-                    replan_prompt = self.build_skeleton_prompt(
+                    replan_prompt = self.build_plan_compile_prompt(
                         planner_material, figures, formulas,
+                        graph=graph, registry=debt_registry,
                     ) + ("\n\n## 上一次规划存在 ID 碰撞\n" + str(collision)
                          + "\n请合并重复单元或明确各自语义角色后重新输出。")
                     try:
@@ -2777,25 +4031,27 @@ class ReadingEngine:
                             heavy=True, max_tokens=PLANNER_OUTPUT_TOKENS,
                         )
                         model_calls += 1
-                        gaps2 = skeleton_output_gaps(out, evidence)
+                        gaps2 = skeleton_output_gaps(
+                            out, evidence, graph=graph, registry=debt_registry)
                         if gaps2:
                             raise ReadingError("重规划骨架不合格：" + "；".join(gaps2))
                         skeleton, metadata = parse_skeleton_full(out)
                         metadata = {**meta_hint, **metadata}
                         plan = ReadingPlan.from_skeleton(
                             skeleton, graph, self.workflow_fingerprint()[:16],
-                            meta={"metadata": metadata},
+                            meta={"metadata": metadata}, registry=debt_registry,
                         )
                     except (PlanCollisionError, KimiError) as replan_exc:
                         raise ReadingError(
                             f"碰撞重规划仍不可用：{replan_exc}") from replan_exc
-            except ReadingError as plan_exc:
-                # 产出优先：骨架/规划失败 → 确定性降级 Plan（三功能节 + 单层综合精讲）
+            except (ReadingError, KimiError) as plan_exc:
+                # 产出优先：骨架/规划失败（含 PlanCompiler KimiError，第 8 步收口）
+                # → 确定性降级 Plan（三功能节 + 单层综合精讲），绝不判死
                 logger.warning("骨架/规划失败，启用确定性降级 Plan：%s", plan_exc)
                 skeleton, metadata = _degraded_skeleton(meta_hint, arxiv_id)
                 plan = ReadingPlan.from_skeleton(
                     skeleton, graph, self.workflow_fingerprint()[:16],
-                    meta={"metadata": metadata},
+                    meta={"metadata": metadata}, registry=debt_registry,
                 )
                 plan_needs_review = False
                 progress("⚠️ 教学规划不可用，按确定性降级 Plan 继续生成")
@@ -2804,8 +4060,11 @@ class ReadingEngine:
         else:
             timer.mark("骨架")
             skeleton, metadata = plan.to_skeleton()
+        # 债务 owner 写回（registry 克隆上改，不落盘——审核后统一提交落盘）
+        debt_owned = plan.bind_debt_owners(debt_registry)
         evidence_chunk_ids = {c.chunk_id for c in evidence.chunks}
-        plan_gaps = validate_plan(plan, graph, evidence_chunks=evidence_chunk_ids)
+        plan_gaps = validate_plan(plan, graph, evidence_chunks=evidence_chunk_ids,
+                                  registry=debt_registry)
         if plan_gaps:
             # 产出优先：净化（移除指向不存在单元的引用）后继续；仍坏则降级 Plan
             logger.warning("Plan 不变量缺口（净化后继续）：%s", "；".join(plan_gaps[:4]))
@@ -2824,13 +4083,25 @@ class ReadingEngine:
         # 规划前阶段的降级标注并入结果卡（透明状态，不判死）
         for note in pre_plan_notes:
             metadata.setdefault("evidence_issues", []).append(note)
+        # 债务注册表状态透出（debt_count/去重/准入状态/降级原因），供结果卡与报告统计
+        metadata["debt_registry"] = {
+            "debt_count": len(debt_registry.debts),
+            "dedup_removed": debt_stats.get("dedup_removed", 0),
+            "admission_status": debt_registry.admission_status,
+            "registry_revision": debt_registry.registry_revision,
+            "notes": (debt_stats.get("notes") or [])[:8],
+        }
         if graph.issues:
             metadata.setdefault("graph_issues", []).extend(
                 json.dumps(item, ensure_ascii=False)[:160] for item in graph.issues[:6])
+        # 直出 ID 绑定下，assertion_ids 来自 planner 直出 ∩ 图节点；
+        # 图里有 assertion 可引而 core 层一个都没绑上才告警（弱图不重复告警）
+        graph_has_assertions = any(n.kind == "assertion" for n in graph.nodes.values())
         unbound_core = [plan.units[uid].data.get("name")
                         for uid in plan.order.get("layers") or []
                         if plan.units[uid].data.get("depth") == "core"
-                        and not plan.units[uid].assertion_ids]
+                        and not plan.units[uid].assertion_ids
+                        and graph_has_assertions]
         if unbound_core:
             logger.warning("core 层未绑定 assertion（降级继续）：%s", "、".join(unbound_core))
             metadata.setdefault("graph_issues", []).append(
@@ -2843,24 +4114,49 @@ class ReadingEngine:
             if isinstance(raw_manifest, dict):
                 for artifact, inputs in (raw_manifest.get("inputs") or {}).items():
                     manifest.register(artifact, inputs)
+        # 第 8 步：ContinuityLedger 加载（恢复/返工续用历史，schema 不兼容重开）
+        from .reading_continuity import ContinuityLedger
+        ledger = ContinuityLedger()
+        if workspace:
+            raw_ledger = workspace.get_json("continuity-ledger")
+            if isinstance(raw_ledger, dict):
+                try:
+                    ledger = ContinuityLedger.from_dict(raw_ledger)
+                except ValueError:
+                    logger.warning("continuity-ledger schema 不兼容，重开新台账")
 
-        # ---- Plan Reviewer 四状态（ID 化之后，带原文证据）----
-        if plan_needs_review:  # 命中 plan-json 的新建路径才审；缓存命中不再审
+        # ---- PlanAuditor 四状态（ID 化之后，带原文证据）----
+        if plan_needs_review:  # 新建/恢复三项重审条件命中必审；已审缓存命中不再审
             plan, skeleton, metadata = self._review_plan_and_repair(
                 plan, graph, reviewer_client, planner_client,
                 evidence.review_material() if evidence.long_mode else paper_md,
                 paper_md, meta_hint, arxiv_id, workspace, progress,
                 evidence_chunks=evidence_chunk_ids,
+                debt_registry=debt_registry,
             )
+            # 审核收口：记录已审 revision 与准入状态（pending → clean/degraded），
+            # 图摘要同步刷新为本次审核面对的图版本——供恢复侧三项比对
+            # （pending / reviewed_revision≠plan_revision / graph_revision 不符 → 重审）
+            plan.reviewed_revision = plan.plan_revision
+            plan.graph_revision = graph_content_revision(graph)
+            if plan.admission_status == "pending":
+                plan.admission_status = (
+                    "degraded" if plan.meta.get("issues") else "clean")
+            # 债务 owner 在审核后统一重绑：审核循环可能经 replace_plan_fragment/
+            # _local_replan 改动各层 debt_ids（重绑幂等，未动时同值），下游消费者
+            # （块清单/回流/落盘）一律使用审核后的归属
+            debt_owned = plan.bind_debt_owners(debt_registry)
             if workspace:
                 # 审核标注（blocked/review_unavailable/degraded 等）随 Plan 落盘可审计
                 workspace.put_json("plan-json", plan.to_dict())
-        continuity: dict[str, Any] = {
-            "defined_terms": [], "established_claims": [], "open_questions": [],
-        }
+                workspace.put_json("debt-registry", debt_owned.to_dict())
+        # 第 8 步：旧 continuity dict 已由 ContinuityLedger 取代——每单元处理时登记
+        # （_register_unit_continuity），Writer/审核装包按真实依赖注入（_unit_continuity_pack）。
 
         # Planner 的任何文字都不发布；Writer 按计划逐节读取原文包并接受局部审核。
         overview_sections: list[str] = []
+        overview_marked: list[str] = []   # 注入 block 标记的终审审核材料（不发布）
+        block_index: dict[str, str] = {}  # block_id → unit_id（终审定位反查）
         degraded: list[str] = []  # 透明降级撤下的节/层，写入 metadata 供结果卡与报告统计
         full_map = _full_map_text(skeleton)  # 审核器全局归属图（写手不可见）
         for idx, section_contract in enumerate(skeleton.sections, 1):
@@ -2888,9 +4184,14 @@ class ReadingEngine:
                 or _media_marker_gaps(content)
             ):
                 review = None
-            if not content or not self._local_review_passed(review):
+            if not content or not self._gate_review(review, unit_id=unit_id,
+                                                    workspace=workspace):
+                # 第 8 步：Writer 装包按真实依赖注入 continuity（实际注入条目
+                # 登记为 manifest 依赖边 continuity:{entry_id}@revision）
+                cont_state, cont_inputs = self._unit_continuity_pack(
+                    unit_id, plan=plan, ledger=ledger, registry=debt_owned, graph=graph)
                 prompt, source = self.build_section_prompt(
-                    skeleton, section_contract, paper_md, figures, evidence, continuity,
+                    skeleton, section_contract, paper_md, figures, evidence, cont_state,
                 )
                 if workspace:
                     rework_note = workspace.get_text(f"rework-{key}")
@@ -2906,10 +4207,15 @@ class ReadingEngine:
                     # 产出优先：Writer 失败 → 占位段+degraded 标注，继续后续单元；
                     # 占位不写检查点，下次重跑可重新生成
                     logger.warning("章节「%s」生成失败，占位降级继续：%s", title, exc)
+                    progress(f"⚠ {title}：生成失败，以占位段降级交付")
                     degraded.append(f"章节「{title}」")
-                    overview_sections.append(
-                        f"## {title}\n\n> ⚠️ 本节生成失败（{exc}），"
-                        "以占位段降级交付，请对照原论文对应章节核实。")
+                    # 占位单元不建立任何连续状态：撤下旧条目，失效旧消费者
+                    self._register_unit_continuity(ledger, unit_id, None,
+                                                   manifest, workspace)
+                    placeholder = (f"## {title}\n\n> ⚠️ 本节生成失败（{exc}），"
+                                   "以占位段降级交付，请对照原论文对应章节核实。")
+                    overview_sections.append(placeholder)
+                    overview_marked.append(placeholder)  # 占位无块标记，原样进审核材料
                     continue
                 content = _hoist_media_markers(content)  # 格式机械修，省一次模型重写
                 content = _strip_inline_latex(content)  # LaTeX 机械转纯文本
@@ -2922,40 +4228,82 @@ class ReadingEngine:
                     review = {"pass": False, "_structural": True, "issues": [{
                         "problem": "；".join(section_gaps),
                     }]}
-                elif light_review:
-                    # 轻审=只审范围（越界/跨单元重复，收窄判定），事实归全审与终审
-                    review = self._review_section(
-                        reviewer_client, content, section_contract, continuity, source,
-                        full_map=full_map, scope_only=True,
-                        preparations=_preparations_text(section_contract),
-                    )
-                    review["tier"] = "light"
-                    model_calls += 1
                 else:
-                    review = self._review_section(
-                        reviewer_client, content, section_contract, continuity, source,
-                        full_map=full_map,
-                    )
-                    model_calls += 1
-                for _rewrite in range(LOCAL_REVIEW_MAX_REWRITES):
-                    if self._local_review_passed(review):
-                        break
+                    # 审核材料注入 block 标记（只给审核器看，发布稿不带走）
+                    _, marked_content = self._unit_blocks(
+                        unit_id, content, workspace, debt_owned, graph)
+                    if light_review:
+                        # 轻审=只审范围（越界/跨单元重复，收窄判定），事实归全审与终审
+                        review = self._review_section(
+                            reviewer_client, marked_content, section_contract, cont_state,
+                            source, full_map=full_map, scope_only=True,
+                            preparations=_preparations_text(section_contract),
+                        )
+                        review["tier"] = "light"
+                        model_calls += 1
+                    else:
+                        review = self._review_section(
+                            reviewer_client, marked_content, section_contract,
+                            cont_state, source, full_map=full_map,
+                        )
+                        model_calls += 1
+                # ---- 第 6 步：审核失败先按 root_scope 分流（plan/graph/asset 先行）----
+                unit_notes: list[str] = []
+                if not self._gate_review(review, unit_id=unit_id, workspace=workspace):
+                    committed, review, unit_notes = self._route_unit_issues(
+                        review, unit_id=unit_id, plan=plan, registry=debt_owned,
+                        graph=graph, planner_client=planner_client, paper_md=paper_md,
+                        workspace=workspace, evidence_chunks=evidence_chunk_ids,
+                        manifest=manifest, progress=progress)
+                    if committed:
+                        # 回流已提交：受影响单元精准失效，递归重跑——检查点保证
+                        # 未受影响单元正文不碰、Writer 零调用
+                        return self.run(
+                            paper_md, figures, formulas, arxiv_id, meta_hint, progress,
+                            workspace, rework_round=rework_round,
+                            calls_carry=calls_carry + model_calls)
+                # ---- body 路径：block 机械删块 → 补丁一次 → 重写一次 → 保留+批注 ----
+                last_valid = content      # 重写前快照（失败恢复+批注）
+                patch_used = False        # block 机械操作与模型补丁共用一次预算
+                rewrites = 0
+                while not self._gate_review(review, unit_id=unit_id, workspace=workspace):
                     correction = self._review_issues(review if isinstance(review, dict) else {})
-                    # 结构重复禁入补丁：整章需按全局归属图重审，局部补丁无权放行
+                    # 结构重复禁入补丁：按新分流走 plan/块级路径，局部补丁无权放行
                     struct_dup = isinstance(review, dict) and any(
                         "结构重复：" in str(it.get("problem") or "")
                         for it in (review.get("issues") or []) if isinstance(it, dict)
                     )
                     patch_edits: list[dict] | None = None
                     pre_patch: tuple[str, dict[str, Any]] | None = None
-                    if (_rewrite == 0 and not struct_dup
-                            and isinstance(review, dict) and not review.get("_structural")):
-                        patched_result = self._try_patch(writer_client, content, correction, source)
-                        if patched_result is not None:
+                    block_context: str | None = None
+                    if not patch_used and isinstance(review, dict) \
+                            and not review.get("_structural"):
+                        # ① 块级机械修复（零模型）：issue 带 body_block_ids 直接删块
+                        block_result = self._delete_issue_blocks(
+                            review, unit_id=unit_id, content=content,
+                            registry=debt_owned, graph=graph)
+                        if block_result is not None:
                             pre_patch = (content, review)
-                            content, patch_edits = patched_result
-                            model_calls += 1
+                            content, patch_edits, block_context = block_result
+                            patch_used = True
+                            progress(f"✎ 补丁修复：{title}")
+                        elif not struct_dup:
+                            # ② 无 block 定位 → 现有补丁一次
+                            patched_result = self._try_patch(
+                                writer_client, content, correction, source)
+                            if patched_result is not None:
+                                pre_patch = (content, review)
+                                content, patch_edits = patched_result
+                                model_calls += 1
+                                progress(f"✎ 补丁修复：{title}")
+                            patch_used = True  # 补丁不可用（锚点缺失等）：预算消耗转入重写
+                        else:
+                            patch_used = True  # 结构重复禁入补丁（现行规则保留）
                     if patch_edits is None:
+                        # ③ 仍失败 → 整单元重写一次（LOCAL_REVIEW_MAX_REWRITES=1）
+                        if rewrites >= LOCAL_REVIEW_MAX_REWRITES:
+                            break
+                        last_valid = content
                         retry_prompt = (
                             prompt + "\n\n## 审核要求重写\n" + correction
                             + "\n重新完整输出本章，不要输出解释或其他章节。"
@@ -2974,6 +4322,9 @@ class ReadingEngine:
                         content = _strip_inline_latex(content)  # LaTeX 机械转纯文本
                         content = _fit_heading(content, 2, title)  # 标题机械归一
                         model_calls += 1
+                        rewrites += 1
+                        progress(f"✎ 重写：{title}"
+                                 f"（{correction.split('；', 1)[0].strip()[:30]}）")
                     retry_gaps = _media_marker_gaps(content)
                     if not _starts_with_heading(content, 2, title):
                         retry_gaps.append(f"必须以二级标题「{title}」开头")
@@ -2986,18 +4337,11 @@ class ReadingEngine:
                             content, "结构缺口：" + "；".join(retry_gaps))
                         review = {"pass": True, "tier": "degraded-structure",
                                   "issues": [], "degraded": True}
-                    if light_review:
-                        review = self._review_section(
-                            reviewer_client, content, section_contract, continuity,
-                            source, full_map=full_map, scope_only=True,
-                            preparations=_preparations_text(section_contract),
-                        )
-                        review["tier"] = "light"
-                        model_calls += 1
-                    elif patch_edits is not None:
-                        # 补丁复核：只审改动区域，不重审整节（合同覆盖首轮已验）
+                    if patch_edits is not None:
+                        # 补丁/删块复核：只审改动块+相邻句，不重审整节
                         review = self._patch_review(
                             reviewer_client, patch_edits, content, correction, source,
+                            context_override=block_context,
                         )
                         model_calls += 1
                         if (isinstance(review, dict) and review.get("revert_patch")
@@ -3012,36 +4356,73 @@ class ReadingEngine:
                             ]}
                             break
                     else:
-                        review = self._review_section(
-                            reviewer_client, content, section_contract, continuity, source,
-                            full_map=full_map,
-                        )
-                        model_calls += 1
-                if not self._local_review_passed(review):
-                    # 保留+批注：三轮仍带高严重度问题 → 全文保留，顶部插入存疑横幅；
-                    # 不再整节撤下（句级错误不连坐），终审独立复核核心链路
+                        _, marked_content = self._unit_blocks(
+                            unit_id, content, workspace, debt_owned, graph)
+                        if light_review:
+                            review = self._review_section(
+                                reviewer_client, marked_content, section_contract,
+                                cont_state, source, full_map=full_map, scope_only=True,
+                                preparations=_preparations_text(section_contract),
+                            )
+                            review["tier"] = "light"
+                            model_calls += 1
+                        else:
+                            review = self._review_section(
+                                reviewer_client, marked_content, section_contract,
+                                cont_state, source, full_map=full_map,
+                            )
+                            model_calls += 1
+                unit_passed = self._gate_review(review, unit_id=unit_id,
+                                                workspace=workspace)
+                if unit_passed and isinstance(review, dict):
+                    if str(review.get("tier") or "") == "review_unavailable":
+                        # 审核服务不可用：放行但透明标注（重写 0 次）
+                        progress(f"⚠ {title}：审核服务不可用，本单元未经完整审核")
+                    elif review.get("carried_issues"):
+                        # 高严重度为零、中低意见放行：随终审独立复核
+                        progress(f"✓ 局审通过：{title}"
+                                 f"（带 {len(review['carried_issues'])} 条待复核意见）")
+                if not unit_passed:
+                    # 保留+批注：预算内仍带高严重度问题 → 恢复 last_valid 快照，
+                    # 全文保留，顶部插入存疑横幅；不整节撤下（句级错误不连坐）
+                    if rewrites:
+                        content = last_valid
                     brief = self._review_issues(review if isinstance(review, dict) else {})
-                    logger.warning("章节「%s」三轮审核未过，保留全文加批注：%s", title, brief[:120])
+                    if unit_notes:
+                        brief = "；".join([*unit_notes, brief])
+                    logger.warning("章节「%s」审核未过，保留全文加批注：%s", title, brief[:120])
+                    progress(f"⚠ {title}：审核未过，保留全文加批注")
                     degraded.append(f"章节「{title}」")
                     content = _annotate_degraded(content, brief)
                     review = {**(review if isinstance(review, dict) else {}),
                               "degraded": True, "degrade_mode": "annotated", "pass": False}
+                elif unit_notes:
+                    # 路由阶段遗留（plan/graph 回流失败降级）：批注透明交付，不重写
+                    logger.warning("章节「%s」携带回流降级批注交付：%s",
+                                   title, "；".join(unit_notes)[:120])
+                    degraded.append(f"章节「{title}」")
+                    content = _annotate_degraded(content, "；".join(unit_notes))
+                    review = {**(review if isinstance(review, dict) else {}),
+                              "degraded": True, "degrade_mode": "annotated"}
+                # 第 4 步：本单元 issue 终态收口（resolved / degraded_with_reason）
+                self._close_unit_issues(unit_id, passed=unit_passed, review=review,
+                                        label=title, workspace=workspace)
                 if workspace:
                     workspace.put_text(key, content)
                     if isinstance(review, dict):
-                        # 产物签名随审核落盘：workflow 指纹 + unit semantic_revision
+                        # 产物签名随审核落盘：workflow 指纹 + unit semantic_revision；
+                        # continuity_input_ids 随审核留痕（实际注入什么登记什么）
                         review = {**review, "_artifact_sig": self._artifact_sig(
-                            key, plan.units[unit_id].semantic_revision)}
+                            key, plan.units[unit_id].semantic_revision),
+                            "_continuity_input_ids": [eid for eid, _ in cont_inputs]}
                     workspace.put_json(review_key, review)
                     workspace.invalidate_from((f"rework-{key}",))  # 返工意见一次有效
-                    prev_dep = {}
-                    if idx > 1:
-                        prev_uid = plan.order["sections"][idx - 2]
-                        prev_dep[f"body-{prev_uid}"] = 1
+                    # 第 8 步：删除 body-{prev_uid} 默认前序边——依赖只登记
+                    # plan 合同 revision + 实际注入的 continuity 条目 + 绑定 deps
                     manifest.register(
                         f"body-{unit_id}",
                         {f"plan:{unit_id}": plan.units[unit_id].semantic_revision,
-                         **prev_dep,
+                         **{f"continuity:{eid}": rev for eid, rev in cont_inputs},
                          **_unit_binding_deps(plan.units[unit_id])},
                     )
                     manifest.register(
@@ -3050,9 +4431,15 @@ class ReadingEngine:
                     )
                     workspace.put_json("dependency-manifest",
                                        {"inputs": manifest._inputs})
-            if isinstance(review, dict) and not review.get("degraded"):
-                self._merge_continuity(continuity, review)
+            # 第 8 步：局审出口登记 continuity（未降级才建立；降级撤下旧条目），
+            # 条目变化按 manifest 依赖边精准失效消费者
+            self._register_unit_continuity(ledger, unit_id, review, manifest, workspace)
+            # 每单元 block manifest 落盘 + 终审审核材料（注入标记版）
+            bm_final, marked_final = self._unit_blocks(
+                unit_id, content.strip(), workspace, debt_owned, graph)
+            block_index.update({b.block_id: unit_id for b in bm_final.blocks})
             overview_sections.append(content.strip())
+            overview_marked.append(marked_final)
         overview_md = "\n\n".join(overview_sections)
 
         progress(f"✅ 教学计划完成（识别出 {len(skeleton.layers)} 个技术层），开始分层精讲")
@@ -3060,6 +4447,7 @@ class ReadingEngine:
         # ---- 调用 2..N+1：每层一次 heavy 教学，缺理解闭环时修正重试 ----
         total_layers = len(skeleton.layers)
         layer_sections: list[str] = []
+        layers_marked: list[str] = []   # 注入 block 标记的终审审核材料（不发布）
         timer.mark("精讲开始")
         for i, layer in enumerate(skeleton.layers, 1):
             progress(f"精讲 层{i}/{total_layers}：{layer.name}")
@@ -3075,6 +4463,10 @@ class ReadingEngine:
                 logger.info("产物签名不匹配，失效重写：%s", layer_key)
                 content, local_review = None, None
             # 层 prompt 要打包原文包，缓存命中时白构建一次太贵；只在真要调模型前懒构建。
+            # continuity 装包很轻（台账条目 × 探针 bigram），逐轮确定性重算：
+            # Writer 注入与审核侧连续状态、manifest 依赖边共用同一份。
+            cont_state, cont_inputs = self._unit_continuity_pack(
+                layer_uid, plan=plan, ledger=ledger, registry=debt_owned, graph=graph)
             prompt: str | None = None
 
             def layer_prompt() -> str:
@@ -3082,7 +4474,7 @@ class ReadingEngine:
                 if prompt is None:
                     prompt = self.build_layer_prompt(
                         skeleton, layer, i, total_layers, paper_md, figures,
-                        previous_layers=layer_sections,
+                        continuity_state=cont_state,
                         formulas=formulas,
                         evidence=evidence,
                     )
@@ -3103,10 +4495,15 @@ class ReadingEngine:
                     # 产出优先：本层生成失败 → 占位层+degraded 标注，继续后续层；
                     # 占位不写检查点，下次重跑可重新生成
                     logger.warning("技术层「%s」生成失败，占位降级继续：%s", layer.name, exc)
+                    progress(f"⚠ {layer.name}：生成失败，以占位段降级交付")
                     degraded.append(f"技术层「{layer.name}」")
-                    layer_sections.append(
-                        f"### {layer.name}\n\n> ⚠️ 本层生成失败（{exc}），"
-                        "以占位段降级交付，请对照原论文核实。")
+                    # 占位单元不建立任何连续状态：撤下旧条目，失效旧消费者
+                    self._register_unit_continuity(ledger, layer_uid, None,
+                                                   manifest, workspace)
+                    placeholder = (f"### {layer.name}\n\n> ⚠️ 本层生成失败（{exc}），"
+                                   "以占位段降级交付，请对照原论文核实。")
+                    layer_sections.append(placeholder)
+                    layers_marked.append(placeholder)  # 占位无块标记，原样进审核材料
                     timer.mark(f"层{i}")
                     continue
                 content = _hoist_media_markers(content)  # 格式机械修，省一次模型重写
@@ -3151,7 +4548,8 @@ class ReadingEngine:
                     content, "结构缺口：" + "、".join(gaps))
                 local_review = {"pass": True, "tier": "degraded-structure",
                                 "issues": [], "degraded": True}
-            if not self._local_review_passed(local_review):
+            if not self._gate_review(local_review, unit_id=layer_uid,
+                                     workspace=workspace):
                 layer_contract = {
                     "kind": "technical_layer",
                     "name": layer.name,
@@ -3167,38 +4565,81 @@ class ReadingEngine:
                     evidence.source_packet(layer.source_refs, [*layer.source_hints, layer.name])
                     if evidence.long_mode else paper_md  # 与写作同一份全文，审核共享缓存前缀
                 )
+                # 审核材料注入 block 标记（只给审核器看，发布稿不带走）
+                _, marked_content = self._unit_blocks(
+                    layer_uid, content, workspace, debt_owned, graph)
                 if layer.depth != "core":
                     # 轻审=只审范围；事实与债务核验收归终审；core 层仍逐层模型审
                     local_review = self._review_section(
-                        reviewer_client, content, layer_contract, continuity, source,
+                        reviewer_client, marked_content, layer_contract, cont_state, source,
                         full_map=full_map, scope_only=True,
                     )
                     local_review["tier"] = "light"
                     model_calls += 1
                 else:
                     local_review = self._review_section(
-                        reviewer_client, content, layer_contract, continuity, source,
+                        reviewer_client, marked_content, layer_contract, cont_state, source,
                         full_map=full_map,
                     )
                     model_calls += 1
-                for _rewrite in range(LOCAL_REVIEW_MAX_REWRITES):
-                    if self._local_review_passed(local_review):
-                        break
+                # ---- 第 6 步：审核失败先按 root_scope 分流（plan/graph/asset 先行）----
+                unit_notes: list[str] = []
+                if not self._gate_review(local_review, unit_id=layer_uid,
+                                         workspace=workspace):
+                    committed, local_review, unit_notes = self._route_unit_issues(
+                        local_review, unit_id=layer_uid, plan=plan, registry=debt_owned,
+                        graph=graph, planner_client=planner_client, paper_md=paper_md,
+                        workspace=workspace, evidence_chunks=evidence_chunk_ids,
+                        manifest=manifest, progress=progress)
+                    if committed:
+                        # 回流已提交：受影响单元精准失效，递归重跑——检查点保证
+                        # 未受影响单元正文不碰、Writer 零调用
+                        return self.run(
+                            paper_md, figures, formulas, arxiv_id, meta_hint, progress,
+                            workspace, rework_round=rework_round,
+                            calls_carry=calls_carry + model_calls)
+                # ---- body 路径：block 机械删块 → 补丁一次 → 重写一次 → 保留+批注 ----
+                last_valid = content      # 重写前快照（失败恢复+批注）
+                patch_used = False        # block 机械操作与模型补丁共用一次预算
+                rewrites = 0
+                while not self._gate_review(local_review, unit_id=layer_uid,
+                                            workspace=workspace):
                     correction = self._review_issues(local_review)
-                    # 结构重复禁入补丁：整章需按全局归属图重审
+                    # 结构重复禁入补丁：按新分流走 plan/块级路径，局部补丁无权放行
                     struct_dup = isinstance(local_review, dict) and any(
                         "结构重复：" in str(it.get("problem") or "")
                         for it in (local_review.get("issues") or []) if isinstance(it, dict)
                     )
                     patch_edits: list[dict] | None = None
                     pre_patch: tuple[str, dict[str, Any]] | None = None
-                    if _rewrite == 0 and not struct_dup:
-                        patched_result = self._try_patch(writer_client, content, correction, source)
-                        if patched_result is not None:
+                    block_context: str | None = None
+                    if not patch_used and isinstance(local_review, dict):
+                        # ① 块级机械修复（零模型）：issue 带 body_block_ids 直接删块
+                        block_result = self._delete_issue_blocks(
+                            local_review, unit_id=layer_uid, content=content,
+                            registry=debt_owned, graph=graph)
+                        if block_result is not None:
                             pre_patch = (content, local_review)
-                            content, patch_edits = patched_result
-                            model_calls += 1
+                            content, patch_edits, block_context = block_result
+                            patch_used = True
+                            progress(f"✎ 补丁修复：{layer.name}")
+                        elif not struct_dup:
+                            # ② 无 block 定位 → 现有补丁一次
+                            patched_result = self._try_patch(
+                                writer_client, content, correction, source)
+                            if patched_result is not None:
+                                pre_patch = (content, local_review)
+                                content, patch_edits = patched_result
+                                model_calls += 1
+                                progress(f"✎ 补丁修复：{layer.name}")
+                            patch_used = True  # 补丁不可用（锚点缺失等）：预算消耗转入重写
+                        else:
+                            patch_used = True  # 结构重复禁入补丁（现行规则保留）
                     if patch_edits is None:
+                        # ③ 仍失败 → 整单元重写一次（LOCAL_REVIEW_MAX_REWRITES=1）
+                        if rewrites >= LOCAL_REVIEW_MAX_REWRITES:
+                            break
+                        last_valid = content
                         try:
                             content = writer_client.chat_full(
                                 [{"role": "user", "content": (
@@ -3216,6 +4657,9 @@ class ReadingEngine:
                         content = _strip_inline_latex(content)  # LaTeX 机械转纯文本
                         content = _clean_layer_surface(content, layer.name)  # 表面机械清理
                         model_calls += 1
+                        rewrites += 1
+                        progress(f"✎ 重写：{layer.name}"
+                                 f"（{correction.split('；', 1)[0].strip()[:30]}）")
                     gaps = teaching_layer_gaps(content, layer)
                     if gaps:
                         logger.warning("技术层「%s」重写后结构缺口，批注继续：%s",
@@ -3224,8 +4668,10 @@ class ReadingEngine:
                         content = _annotate_degraded(
                             content, "结构缺口：" + "、".join(gaps))
                     if patch_edits is not None:
+                        # 补丁/删块复核：只审改动块+相邻句，不重审整层
                         local_review = self._patch_review(
                             reviewer_client, patch_edits, content, correction, source,
+                            context_override=block_context,
                         )
                         if (isinstance(local_review, dict)
                                 and local_review.get("revert_patch")
@@ -3241,40 +4687,80 @@ class ReadingEngine:
                             model_calls += 1
                             break
                     else:
+                        _, marked_content = self._unit_blocks(
+                            layer_uid, content, workspace, debt_owned, graph)
                         local_review = self._review_section(
-                            reviewer_client, content, layer_contract, continuity, source,
+                            reviewer_client, marked_content, layer_contract, cont_state, source,
                             full_map=full_map,
                         )
                     model_calls += 1
-                if not self._local_review_passed(local_review):
+                layer_passed = self._gate_review(local_review, unit_id=layer_uid,
+                                                 workspace=workspace)
+                if layer_passed and isinstance(local_review, dict):
+                    if str(local_review.get("tier") or "") == "review_unavailable":
+                        # 审核服务不可用：放行但透明标注（重写 0 次）
+                        progress(f"⚠ {layer.name}：审核服务不可用，本单元未经完整审核")
+                    elif local_review.get("carried_issues"):
+                        # 高严重度为零、中低意见放行：随终审独立复核
+                        progress(f"✓ 局审通过：{layer.name}"
+                                 f"（带 {len(local_review['carried_issues'])} 条待复核意见）")
+                if not layer_passed:
+                    # 保留+批注：预算内仍带高严重度问题 → 恢复 last_valid 快照，
+                    # 全文保留，顶部插入存疑横幅
+                    if rewrites:
+                        content = last_valid
                     brief = self._review_issues(local_review if isinstance(local_review, dict) else {})
-                    logger.warning("技术层「%s」三轮审核未过，保留全文加批注：%s", layer.name, brief[:120])
+                    if unit_notes:
+                        brief = "；".join([*unit_notes, brief])
+                    logger.warning("技术层「%s」审核未过，保留全文加批注：%s", layer.name, brief[:120])
+                    progress(f"⚠ {layer.name}：审核未过，保留全文加批注")
                     degraded.append(f"技术层「{layer.name}」")
                     content = _annotate_degraded(content, brief)
                     local_review = {**(local_review if isinstance(local_review, dict) else {}),
                                     "degraded": True, "degrade_mode": "annotated", "pass": False}
+                elif unit_notes:
+                    # 路由阶段遗留（plan/graph 回流失败降级）：批注透明交付，不重写
+                    logger.warning("技术层「%s」携带回流降级批注交付：%s",
+                                   layer.name, "；".join(unit_notes)[:120])
+                    degraded.append(f"技术层「{layer.name}」")
+                    content = _annotate_degraded(content, "；".join(unit_notes))
+                    local_review = {**(local_review if isinstance(local_review, dict) else {}),
+                                    "degraded": True, "degrade_mode": "annotated"}
+                # 第 4 步：本层 issue 终态收口（resolved / degraded_with_reason）
+                self._close_unit_issues(layer_uid, passed=layer_passed,
+                                        review=local_review, label=layer.name,
+                                        workspace=workspace)
                 if workspace:
                     workspace.put_text(layer_key, content)
                     if isinstance(local_review, dict):
-                        # 产物签名随审核落盘：workflow 指纹 + unit semantic_revision
+                        # 产物签名随审核落盘：workflow 指纹 + unit semantic_revision；
+                        # continuity_input_ids 随审核留痕（实际注入什么登记什么）
                         local_review = {**local_review, "_artifact_sig": self._artifact_sig(
-                            layer_key, plan.units[layer_uid].semantic_revision)}
+                            layer_key, plan.units[layer_uid].semantic_revision),
+                            "_continuity_input_ids": [eid for eid, _ in cont_inputs]}
                     workspace.put_json(layer_review_key, local_review)
                     workspace.invalidate_from((f"rework-{layer_key}",))  # 返工意见一次有效
+                    # 第 8 步：删除 body-{prev_layer_uid} 默认前序边——依赖只登记
+                    # plan 合同 revision + 实际注入的 continuity 条目 + 绑定 deps
                     layer_deps = {f"plan:{layer_uid}":
                                   plan.units[layer_uid].semantic_revision,
+                                  **{f"continuity:{eid}": rev for eid, rev in cont_inputs},
                                   **_unit_binding_deps(plan.units[layer_uid])}
-                    if i > 1:
-                        prev_layer_uid = plan.order["layers"][i - 2]
-                        layer_deps[f"body-{prev_layer_uid}"] = 1
                     manifest.register(layer_key, layer_deps)
                     workspace.put_json("dependency-manifest",
                                        {"inputs": manifest._inputs})
-            if isinstance(local_review, dict) and not local_review.get("degraded"):
-                self._merge_continuity(continuity, local_review)
+            # 第 8 步：局审出口登记 continuity（未降级才建立；降级撤下旧条目），
+            # 条目变化按 manifest 依赖边精准失效消费者
+            self._register_unit_continuity(ledger, layer_uid, local_review,
+                                           manifest, workspace)
             section_body = re.sub(r"^###\s*[^\n]+\n+", "", content.strip(), count=1)
             section = f"### {layer.name}\n\n{section_body}"
+            # 每单元 block manifest 落盘 + 终审审核材料（注入标记版）
+            bm_final, marked_final = self._unit_blocks(
+                layer_uid, section, workspace, debt_owned, graph)
+            block_index.update({b.block_id: layer_uid for b in bm_final.blocks})
             layer_sections.append(section)
+            layers_marked.append(marked_final)
             timer.mark(f"层{i}")
         layers_md = "\n\n".join(layer_sections)
         timer.mark("精讲")
@@ -3415,6 +4901,16 @@ class ReadingEngine:
                 )
                 figure_inlines[label] = "本图自动讲解未通过局部验收，请以原图和图注为准。"
                 logger.warning("图表讲解透明降级：%s（%s，%s）", label, asset.caption[:80], "、".join(gaps))
+                # 第 4 步：图表验收缺口入台账并带原因降级（禁静默丢失）
+                self._ledger_register_review(
+                    {"issues": [{"severity": "中",
+                                 "problem": f"图表讲解未通过局部验收：{'、'.join(gaps)}"}]},
+                    stage="figure", target_ids=[label], workspace=workspace)
+                self._ledger_degrade(
+                    [issue.issue_id for issue in self._ledger().open_issues(stage="figure")
+                     if label in issue.target_ids],
+                    "图表讲解透明降级：保留原图与图注，未补写读数/比较/因果结论",
+                    workspace)
             progress(
                 f"⚠️ {len(invalid_figures)} 张图表讲解未通过局部验收；"
                 "保留原图和图注，正文继续发布"
@@ -3445,6 +4941,11 @@ class ReadingEngine:
                 metadata.setdefault("document_gaps", remaining)
             body = repaired
         review_source = evidence.review_material() if evidence.long_mode else paper_md
+        # 终审审核材料：注入 block 标记的版本（只给审核器看，发布稿 body 不带走）
+        review_body = self._assemble_final(
+            metadata, skeleton, "\n\n".join(layers_marked), figures, figure_notes,
+            figure_inlines, overview_md="\n\n".join(overview_marked),
+        ) if (overview_marked or layers_marked) else body
         cached_body = workspace.get_text("final-body") if workspace else None
         review = workspace.get_json("final-review") if workspace and cached_body == body else None
         if isinstance(review, dict) and not self._artifact_sig_matches(
@@ -3454,9 +4955,27 @@ class ReadingEngine:
             review = None
         if not isinstance(review, dict):
             review = self._review_final(
-                body, review_source, formulas, skeleton, client=reviewer_client,
+                review_body, review_source, formulas, skeleton, client=reviewer_client,
             )
             model_calls += 1
+            if review.get("review_unavailable"):
+                # 产出优先：终审不可用不杀正文——横幅标注交付（正文重写 0 次）
+                progress("⚠ 终审服务不可用，按未经终审复核标注交付")
+            # 第 8 步机制 A 程序对账：同一图讲解段跨单元重复 → issue 并入终审
+            # （body 类块定位，走有界返工；仅新鲜终审补一次，缓存终审已含；
+            # 终审不可用时不加注——review_unavailable 口径正文重写 0 次）
+            if not review.get("review_unavailable"):
+                repeat_issues = self._figure_repeat_issues(
+                    body, figures, figure_notes,
+                    [*zip(plan.order.get("sections") or [], overview_sections),
+                     *zip(plan.order.get("layers") or [], layer_sections)])
+                if repeat_issues:
+                    logger.info("图讲解跨单元重复对账：%d 条（body 类块定位）",
+                                len(repeat_issues))
+                    review = {**review, "issues": [
+                        *(review.get("issues") or []), *repeat_issues]}
+        # 第 4 步：终审 issues 归一进台账（幂等；review_unavailable 以对应 kind 入册）
+        self._ledger_register_review(review, stage="final", workspace=workspace)
         passed = _review_bool(review.get("pass")) is True
         score = review.get("score")
         score_valid = (not isinstance(score, bool) and isinstance(score, (int, float))
@@ -3480,13 +4999,46 @@ class ReadingEngine:
                 f"{item.get('location', '全文')}：{item.get('problem', '')}"
                 for item in issues[:5] if isinstance(item, dict)
             ) or str(review.get("summary") or "终审未通过")
-            if not score_valid:
+            if review_unavailable:
+                # 审核不可用不是“评分异常通过”，正文必须明确写出未经终审复核。
+                detail = str(review.get("summary") or "终审服务不可用，未经终审复核")
+            elif not score_valid:
                 detail = ("终审返回的评分缺失或异常（审核模型输出不完整）；"
                           "正文按程序检查与局审结果交付")
+            # 第 6 步：终审 plan 类问题也走回流（预算内），不只重写正文
+            if score_valid and workspace is not None:
+                final_plan_issues = [
+                    i for i in self._parse_review_issues(review, stage="final")
+                    if i.root_scope == "plan" and i.kind != "review_unavailable"
+                ]
+                if final_plan_issues:
+                    committed, reflux_notes = self._attempt_plan_reflux(
+                        final_plan_issues, plan=plan, registry=debt_owned, graph=graph,
+                        planner_client=planner_client, paper_md=paper_md,
+                        workspace=workspace, evidence_chunks=evidence_chunk_ids,
+                        manifest=manifest, progress=progress,
+                        raw_repairs=review.get("repairs"))
+                    if committed:
+                        logger.warning("终审 plan 类问题回流成功，递归重跑：%s",
+                                       "；".join(reflux_notes))
+                        return self.run(
+                            paper_md, figures, formulas, arxiv_id, meta_hint, progress,
+                            workspace, rework_round=rework_round,
+                            calls_carry=calls_carry + model_calls,
+                        )
+                    if reflux_notes:
+                        metadata.setdefault("final_plan_reflux_notes",
+                                            []).extend(reflux_notes)
+            # 终审定位：block_id/debt_id 结构化反查优先，展示名模糊匹配兜底
+            debt_owner = {
+                did: uid
+                for uid in (plan.order.get("layers") or []) if uid in plan.units
+                for did in (plan.units[uid].data.get("debt_ids") or [])
+            }
             failed_units, core_involved = _locate_failed_units(
                 review if isinstance(review, dict) else {},
                 skeleton, contract_gaps, {asset.label for asset in figures},
-                plan=plan,
+                plan=plan, block_index=block_index, debt_owner=debt_owner,
             )
             # 定点返工：能定位且还有返工轮次 → 作废失败单元检查点+留返工意见
             if failed_units and workspace is not None and rework_round < 2 and score_valid:
@@ -3502,7 +5054,10 @@ class ReadingEngine:
                         dirty = manifest.dirty_closure({key: 0})  # rev 0 强制失配
                         targets |= dirty
                         for artifact in dirty:
-                            targets.add(artifact.replace("body-", "review-", 1))
+                            if artifact.startswith("body-"):
+                                uid = artifact[len("body-"):]
+                                targets.add(f"review-{uid}")
+                                targets.add(f"blocks-{uid}")  # 块清单随正文一并失效
                     workspace.invalidate_from(tuple(targets) + ("final-review", "final-body"))
                     # 如实输出闭包大小：非 body- 键（如 figure-xxx）无依赖闭包，记 0
                     logger.info("精准失效：%s（含依赖闭包 %d 项）",
@@ -3543,6 +5098,15 @@ class ReadingEngine:
                 metadata["final_review_degraded"] = detail
                 if core_involved:
                     metadata["final_review_core_failed"] = True
+                # 第 4 步：终审未过横幅交付——遗留 open issue 全部带原因降级
+                self._ledger_degrade(
+                    [issue.issue_id for issue in self._ledger().open_issues()],
+                    f"终审未全部通过，横幅交付：{detail[:120]}", workspace)
+        if final_ok:
+            # 第 4 步：终审通过——全部遗留 open issue 视为已被终审复核接受
+            self._ledger_resolve(
+                [issue.issue_id for issue in self._ledger().open_issues()],
+                "final-review:pass", workspace)
         if workspace:
             workspace.put_text("final-body", body)
             if isinstance(review, dict):
@@ -3554,6 +5118,14 @@ class ReadingEngine:
         metadata["graph_stats"] = graph_stats
         if degraded:
             metadata["degraded_sections"] = degraded
+        # 第 4 步收口：入册 issue 不得静默丢失——仍 open 的一律带原因降级并透出汇总
+        stray = [issue.issue_id for issue in self._ledger().open_issues()]
+        if stray:
+            logger.warning("流程收口仍有 %d 条未终结 issue（带原因降级）", len(stray))
+            self._ledger_degrade(
+                stray, "流程收口时仍未解决，随正文批注/横幅透明交付", workspace)
+        metadata["issue_ledger"] = self._ledger().summary()
+        self._ledger_persist(workspace)
         return ReadingResult(
             body_md=body, metadata=metadata,
             layer_names=[l.name for l in skeleton.layers],
@@ -3597,21 +5169,99 @@ class ReadingEngine:
         except KimiError as exc:
             # 产出优先：终审服务不可用不杀正文——review_unavailable 横幅交付
             logger.warning("终审调用失败，标记 review_unavailable 保留正文：%s", exc)
-            return {"pass": True, "score": 8, "review_unavailable": True,
+            return {"pass": False, "score": None, "review_unavailable": True,
                     "summary": "终审服务不可用，未经终审复核",
                     "issues": [], "layer_coverage": [], "teach_back": []}
         try:
             review = json.loads(raw)
         except json.JSONDecodeError:
             logger.warning("终审返回非法 JSON，标记 review_unavailable 保留正文")
-            return {"pass": True, "score": 8, "review_unavailable": True,
+            return {"pass": False, "score": None, "review_unavailable": True,
                     "summary": "终审服务输出异常，未经终审复核",
                     "issues": [], "layer_coverage": [], "teach_back": []}
         if not isinstance(review, dict):
-            return {"pass": True, "score": 8, "review_unavailable": True,
+            return {"pass": False, "score": None, "review_unavailable": True,
                     "summary": "终审服务输出异常，未经终审复核",
                     "issues": [], "layer_coverage": [], "teach_back": []}
         return review
+
+    # 机制 A 程序对账：块文本近乎逐字重复的 bigram 包含度阈值
+    _FIGURE_REPEAT_MIN_CONTAINMENT = 0.75
+    _FIGURE_REPEAT_MIN_CHARS = 60
+
+    def _figure_repeat_issues(self, body: str, figures: list[FigureAsset],
+                              figure_notes: dict[str, str],
+                              unit_bodies: list[tuple[str, str]]) -> list[dict[str, Any]]:
+        """机制 A 程序对账（第 8 步）：同一图讲解段跨单元重复出现 → 终审 issue
+        （body 类块定位，走 _locate_failed_units 有界返工；只报不修）。
+
+        两种确定性形态：
+        ① figure note 完整文本（签名段）在图表总览之外的正文出现；
+        ② 两个单元引用同一图的块彼此近乎逐字（bigram 包含度 ≥ 阈值）——
+           按单元顺序后出现的块判重复。
+        unit_bodies：[(unit_id, 单元正文)] 按文档顺序（节→层）；与 blocks-{uid}
+        同一算法同一输入切块 → block_id 一致，可供 block_index 定位反查。
+        返回可直接并入终审 review["issues"] 的 dict 列表。"""
+        from .reading_blocks import _containment, split_blocks
+
+        def _norm(text: str) -> str:
+            return re.sub(r"[^\w一-鿿]+", "", str(text or "")).casefold()
+
+        main_body = body.split("\n## 图表总览", 1)[0]  # 总览合法持有完整讲解
+        main_norm = _norm(main_body)
+        # 逐单元切块（block_id 与落盘的 blocks-{uid} 一致）；per_unit 保留单元边界
+        blocks: list[tuple[str, str]] = []          # (block_id, text) 按单元顺序
+        per_unit: list[list[tuple[str, str]]] = []  # 同序的按单元分组
+        for uid, unit_body in unit_bodies:
+            manifest = split_blocks(uid, unit_body or "")
+            unit_blocks = [(b.block_id, b.text) for b in manifest.blocks]
+            blocks.extend(unit_blocks)
+            per_unit.append(unit_blocks)
+        issues: list[dict[str, Any]] = []
+        for asset in figures:
+            label = asset.label
+            dup_ids: list[str] = []
+            # ① figure note 完整文本（签名段）出现在图表总览之外
+            note = re.sub(r"\s+", "", str(figure_notes.get(label) or ""))
+            signature = _norm(note)[:120]
+            if len(signature) >= 60 and signature in main_norm:
+                for bid, text in blocks:
+                    if signature[:60] in _norm(text):
+                        dup_ids.append(bid)
+            # ② 跨单元近乎逐字的同图讲解段（保留首次，后出现的判重复）。
+            # 讲解段 = 标记块本身（标记与讲解同块时）或标记块+紧随的讲解块
+            # （split_blocks 会把空行隔开的标记与讲解切成两块）。
+            regions: list[tuple[str, str]] = []  # (讲解块 block_id, 区域文本) 按单元顺序
+            for unit_blocks in per_unit:
+                for pos, (bid, text) in enumerate(unit_blocks):
+                    if f"[[FIG:{label}]]" not in text and label not in text:
+                        continue
+                    if len(_norm(text)) >= self._FIGURE_REPEAT_MIN_CHARS:
+                        regions.append((bid, text))
+                    elif pos + 1 < len(unit_blocks):
+                        next_bid, next_text = unit_blocks[pos + 1]
+                        regions.append((next_bid, text + "\n\n" + next_text))
+            for prev_i, (_, prev_region) in enumerate(regions):
+                if len(_norm(prev_region)) < self._FIGURE_REPEAT_MIN_CHARS:
+                    continue
+                for bid, region in regions[prev_i + 1:]:
+                    if len(_norm(region)) < self._FIGURE_REPEAT_MIN_CHARS:
+                        continue
+                    if max(_containment(region, prev_region),
+                           _containment(prev_region, region)
+                           ) >= self._FIGURE_REPEAT_MIN_CONTAINMENT:
+                        if bid not in dup_ids:
+                            dup_ids.append(bid)
+            if dup_ids:
+                issues.append({
+                    "severity": "高", "kind": "structural_duplication",
+                    "root_scope": "body", "location": label,
+                    "problem": f"结构重复：{label} 的讲解段跨单元重复出现；只保留首次"
+                               "内联位置的完整讲解，其余位置改为「讲解见首次内联位置/"
+                               "图表总览」的短引用",
+                    "debt_ids": [], "body_block_ids": dup_ids,
+                })
+        return issues
 
     @staticmethod
     def _review_contract_gaps(review: dict[str, Any], skeleton: Skeleton) -> list[str]:
@@ -3809,11 +5459,23 @@ class ReadingEngine:
 
     @staticmethod
     def _insert_inline_notes(body: str, figure_inlines: dict[str, str]) -> str:
+        """内联图讲解注入（第 8 步机制 A 去重）：同一张图的完整讲解只保留首次
+        内联位置；后续内联位置替换为短引用（指向首次内联节标题）。
+        图表总览在调用方之后拼接，不受影响。"""
+        headings = [(m.start(), m.group(1).strip())
+                    for m in re.finditer(r"^#{2,3}\s+(.+?)\s*$", body, re.M)]
+        seen: dict[str, str] = {}  # label → 首次内联位置的节标题
+
         def repl(m: re.Match) -> str:
             label = m.group(1).strip()
             inline = figure_inlines.get(label)
             if not inline:
                 return m.group(0)
+            if label in seen:
+                return f"[[FIG:{label}]]\n\n（{label} 讲解见「{seen[label]}」）"
+            heading = next((title for pos, title in reversed(headings)
+                            if pos < m.start()), "图表总览")
+            seen[label] = heading
             return f"[[FIG:{label}]]\n\n**这张图怎么读**：{inline}"
         return re.sub(r"\[\[FIG:([^\]]+)\]\]", repl, body)
 

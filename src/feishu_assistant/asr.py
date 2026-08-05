@@ -21,9 +21,6 @@ logger = logging.getLogger("feishu_assistant.asr")
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
-# 支持的音频扩展名（飞书语音消息为 opus；用户也可能发 mp3/m4a/wav）
-AUDIO_EXTENSIONS = (".opus", ".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".amr", ".webm")
-
 
 class ASRError(Exception):
     """语音转写失败，信息为中文（面向用户的提示用）。"""
@@ -53,12 +50,6 @@ def _mlx_transcribe(audio_path: str, model: str) -> dict[str, Any]:
         ) from exc
     logger.info("mlx-whisper 转写开始：%s（model=%s）", audio_path, model)
     return mlx_whisper.transcribe(audio_path, path_or_hf_repo=model)
-
-
-# ---- [V7.1 清理] 已停用：生产按 message_type 直判音频，不经扩展名。经全项目核对生产链路零引用，保留备查 ----
-# def is_audio_file(file_name: str) -> bool:
-#     """文件名是否像可转写的音频。"""
-#     return file_name.lower().endswith(AUDIO_EXTENSIONS)
 
 
 def _result_from_raw(raw: dict[str, Any]) -> TranscriptResult:

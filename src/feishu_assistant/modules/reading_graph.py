@@ -367,6 +367,77 @@ class SemanticGraph:
 
 
 # ---------------------------------------------------------------------------
+# 目录渲染：prompt 注入用 compact 图目录（DebtCompiler/PlanCompiler 用）
+# ---------------------------------------------------------------------------
+
+def render_graph_catalog(graph: "SemanticGraph", max_chars: int = 6000) -> str:
+    """渲染 compact 图目录文本，供 DebtCompiler/PlanCompiler 注入 prompt。
+
+    - 每个 concept/assertion 一行：
+      node_id | kind | labels | statement(截断) | supported_by→span_id | depends_on→[ids]
+    - source_span 单独 compact 列出：span_id | 起始偏移 | 首行截断
+    - 确定性输出：组内按 ID 排序，与图的构建/遍历顺序无关
+    - 超 max_chars 时按 assertion → concept → span 优先级保留，低位组先省略
+      并在末尾标注各组省略条数
+    """
+    def _node_line(node: GraphNode) -> str:
+        labels = ",".join(node.labels) if node.labels else "-"
+        statement = re.sub(r"\s+", " ", node.statement).strip()
+        if len(statement) > 100:
+            statement = statement[:100] + "…"
+        supports = sorted(e.to_id for e in graph.edges
+                          if e.kind == "supported_by" and e.from_id == node.node_id)
+        depends = sorted(e.to_id for e in graph.edges
+                         if e.kind == "depends_on" and e.from_id == node.node_id)
+        return (f"{node.node_id} | {node.kind} | {labels} | {statement} | "
+                f"supported_by→{','.join(supports) or '-'} | "
+                f"depends_on→[{','.join(depends)}]")
+
+    def _span_line(span: SourceSpan) -> str:
+        first = re.sub(r"\s+", " ", span.text).strip()
+        if len(first) > 60:
+            first = first[:60] + "…"
+        return f"{span.span_id} | {span.start} | {first}"
+
+    # 优先级即保留顺序：assertion 最高，span 最低
+    prioritized: list[tuple[str, list[str]]] = [
+        ("assertion", [_node_line(n) for n in sorted(
+            (n for n in graph.nodes.values() if n.kind == "assertion"),
+            key=lambda n: n.node_id)]),
+        ("concept", [_node_line(n) for n in sorted(
+            (n for n in graph.nodes.values() if n.kind == "concept"),
+            key=lambda n: n.node_id)]),
+        ("source_span", [_span_line(s) for s in sorted(
+            graph.spans.values(), key=lambda s: s.span_id)]),
+    ]
+    out: list[str] = []
+    used = 0
+    cut = False            # 预算耗尽后，低位组整体省略
+    omitted: list[str] = []
+    for title, group_lines in prioritized:
+        header = f"## {title}（共 {len(group_lines)} 条）"
+        if cut or used + len(header) + 1 > max_chars:
+            omitted.append(f"{title} {len(group_lines)} 条")
+            cut = True
+            continue
+        out.append(header)
+        used += len(header) + 1
+        shown = 0
+        for line in group_lines:
+            if used + len(line) + 1 > max_chars:
+                cut = True
+                break
+            out.append(line)
+            used += len(line) + 1
+            shown += 1
+        if shown < len(group_lines):
+            omitted.append(f"{title} {len(group_lines) - shown} 条")
+    if omitted:
+        out.append("…（目录超出预算，已按优先级省略：" + "；".join(omitted) + "）")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # 产物签名与依赖失效
 # ---------------------------------------------------------------------------
 

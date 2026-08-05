@@ -17,14 +17,28 @@ from typing import Any, Iterator
 from ..lifecycle import FileLease
 
 
-PIPELINE_VERSION = "reading-v3"
+PIPELINE_VERSION = "reading-v4"
+V9_PIPELINE_VERSION = "reading-v5"
 
 
 class ReadingWorkspace:
     """一个论文、一版生成协议对应的持久化工作区。"""
 
-    def __init__(self, root: Path | str) -> None:
-        self.root = Path(root) / PIPELINE_VERSION
+    def __init__(
+        self,
+        root: Path | str,
+        pipeline_version: str = PIPELINE_VERSION,
+    ) -> None:
+        """建立指定协议版本的隔离工作区。
+
+        ``reading-v4`` 保留给历史 V8 引擎与其回归测试；正式 V9 使用
+        ``reading-v5``。版本由调用引擎显式选择，避免新旧阶段产物互相命中。
+        """
+        version = str(pipeline_version or PIPELINE_VERSION).strip()
+        if not version or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for ch in version):
+            raise ValueError(f"非法精读工作区版本：{pipeline_version!r}")
+        self.pipeline_version = version
+        self.root = Path(root) / version
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     @contextmanager

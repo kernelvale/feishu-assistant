@@ -43,7 +43,6 @@ from feishu_assistant.modules.digest import (
     rank_entries,
     register_jobs,
     taste_keywords_from_papers,
-    # vector_score,  # [V7.1 清理] 已停用：对应生产代码已停用，保留备查
 )
 
 NOW = time.mktime(datetime.date(2026, 7, 30).timetuple())  # 固定"今天"：2026-07-30
@@ -268,27 +267,6 @@ def test_taste_keywords_from_papers():
     ]
     kws = taste_keywords_from_papers(records)
     assert kws == ["agent", "评测", "Agent Harness", "推理"]
-
-
-# ---- [V7.1 清理] 已停用：对应生产代码 vector_score 已停用（3 个测试）。经全项目核对生产链路零引用，保留备查 ----
-# def test_vector_score_from_index():
-#     assert vector_score(_entry("1", "t"), FakeVectorIndex(hits=[("x", "t", 0.25)])) == 0.75
-#     assert vector_score(_entry("1", "t"), FakeVectorIndex(hits=[])) == 0.0
-#
-#
-# def test_vector_score_excludes_self():
-#     """检索传 exclude_arxiv_id：已入库论文自我命中（距离≈0）不算口味证据。"""
-#     vec = FakeVectorIndex(hits=[("x", "t", 0.25)])
-#     assert vector_score(_entry("2607.00001", "t"), vec) == 0.75
-#     assert vec.search_calls[-1]["exclude_arxiv_id"] == "2607.00001"
-#
-#
-# def test_vector_score_index_error_is_zero():
-#     class BoomIndex:
-#         def search(self, *a, **k):
-#             raise RuntimeError("vec db locked")
-#
-#     assert vector_score(_entry("1", "t"), BoomIndex()) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +653,12 @@ def test_today_digest_without_io():
     assert "生成失败" in text and "未初始化" in text
 
 
-def test_weekly_report_now_writes_doc_and_pushes():
+def test_weekly_report_now_writes_doc_and_pushes(monkeypatch):
     data = {IDEA_TABLE: [{"内容": "做个评测", "时间": NOW_MS - DAY}]}
     docx = FakeDocx()
     svc, sender = make_service(kimi=FakeKimi("## 本周一句话\n围绕评测。"), data=data, docx=docx)
+    import feishu_assistant.modules.digest as _digest_mod
+    monkeypatch.setattr(_digest_mod.time, "time", lambda: NOW)  # 固定“今天”，防真实日期漂移出窗口
     text = svc.weekly_report_now()
     assert "组会周报已生成" in text and "https://feishu.cn/docx/" in text
     assert docx.docs and "本周一句话" in docx.docs[0][1]
