@@ -3,7 +3,7 @@
 - PaperStore：精读论文全文与最近精读记录（追问/绑定会话用）
 - DedupStore：消息幂等去重（飞书长连接"至少一次"投递，重启会重投近期消息）
 - ReadingTaskStore：精读任务登记（进程死在中途后，启动时自动恢复重跑）
-- SessionStore：会话系统（sessions + messages + messages_fts）
+- SessionStore：会话系统（sessions + messages + messages_fts + memories 长期记忆）
 - NotificationOutbox：事件通知外发箱（失败/卡死/恢复必达，断网排队补发）
 
 只依赖标准库 sqlite3，全部可离线测试。多线程并发写：WAL + busy_timeout。
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS papers (
     arxiv_id TEXT NOT NULL,
     title TEXT NOT NULL,
     markdown TEXT NOT NULL,
+    association_text TEXT NOT NULL DEFAULT '',
     doc_url TEXT NOT NULL DEFAULT '',
     pdf_path TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
@@ -65,6 +66,7 @@ class PaperRecord:
     doc_url: str
     pdf_path: str
     created_at: float
+    association_text: str = ""
 
 
 class PaperStore:
@@ -75,6 +77,12 @@ class PaperStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with _open(self.db_path) as conn:
             conn.executescript(_PAPERS_SCHEMA)
+            # 兼容已经运行过的本地库：CREATE TABLE IF NOT EXISTS 不会补新列。
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(papers)")}
+            if "association_text" not in columns:
+                conn.execute(
+                    "ALTER TABLE papers ADD COLUMN association_text TEXT NOT NULL DEFAULT ''"
+                )
 
     def _conn(self) -> sqlite3.Connection:
         return _open(self.db_path)
@@ -85,6 +93,7 @@ class PaperStore:
             id=row["id"], chat_id=row["chat_id"], arxiv_id=row["arxiv_id"],
             title=row["title"], markdown=row["markdown"], doc_url=row["doc_url"],
             pdf_path=row["pdf_path"], created_at=row["created_at"],
+            association_text=row["association_text"],
         )
 
     def save_paper(
@@ -96,13 +105,15 @@ class PaperStore:
         doc_url: str = "",
         pdf_path: str = "",
         created_at: float | None = None,
+        association_text: str = "",
     ) -> int:
         """保存一篇精读论文，返回行 id。"""
         with self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO papers (chat_id, arxiv_id, title, markdown, doc_url, pdf_path, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (chat_id, arxiv_id, title, markdown, doc_url, pdf_path,
+                "INSERT INTO papers"
+                " (chat_id, arxiv_id, title, markdown, association_text, doc_url, pdf_path, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, arxiv_id, title, markdown, association_text, doc_url, pdf_path,
                  created_at if created_at is not None else time.time()),
             )
             return int(cur.lastrowid)
@@ -120,12 +131,48 @@ class PaperStore:
             return None
         return self._row_to_record(row)
 
-    def get_paper_by_arxiv(self, arxiv_id: str) -> PaperRecord | None:
-        """按 arXiv id 取最近一篇精读（绑定会话的论文上下文用）。"""
+    def recent_papers(
+        self,
+        chat_id: str,
+        within_hours: float | None = None,
+        limit: int = 8,
+    ) -> list[PaperRecord]:
+        """取该 chat 最近的不同论文，按时间倒序。
+
+        同一 arXiv/链接论文复读会生成多条全文记录；关联追问时只保留每个查重键
+        最新的一条，避免候选列表里出现多个同名版本。
+        """
+        params: list[object] = [chat_id]
+        sql = "SELECT * FROM papers WHERE chat_id = ?"
+        if within_hours is not None:
+            sql += " AND created_at >= ?"
+            params.append(time.time() - within_hours * 3600)
+        sql += " ORDER BY created_at DESC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        papers: list[PaperRecord] = []
+        seen: set[str] = set()
+        for row in rows:
+            key = str(row["arxiv_id"] or row["title"]).strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            papers.append(self._row_to_record(row))
+            if len(papers) >= limit:
+                break
+        return papers
+
+    def get_paper_by_arxiv(self, arxiv_id: str, chat_id: str = "") -> PaperRecord | None:
+        """按 arXiv id 取最近一篇精读；可限制 chat，防跨会话串文。"""
+        where = "arxiv_id = ?"
+        params: list[object] = [arxiv_id]
+        if chat_id:
+            where += " AND chat_id = ?"
+            params.append(chat_id)
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM papers WHERE arxiv_id = ? ORDER BY created_at DESC LIMIT 1",
-                (arxiv_id,),
+                f"SELECT * FROM papers WHERE {where} ORDER BY created_at DESC LIMIT 1",
+                params,
             ).fetchone()
         return self._row_to_record(row) if row else None
 
@@ -581,6 +628,17 @@ CREATE TABLE IF NOT EXISTS interview_states (
     state TEXT NOT NULL DEFAULT 'active',        -- active | ending | ended
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '备忘',       -- 偏好 | 事实 | 项目 | 决定 | 备忘（口令粗判）
+    content TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    last_hit REAL
+);
+CREATE INDEX IF NOT EXISTS idx_memories_chat ON memories (chat_id, created_at DESC);
 """
 
 _FTS_SCHEMA = """
@@ -641,8 +699,19 @@ class Message:
     created_at: float
 
 
+@dataclass
+class Memory:
+    id: int
+    chat_id: str
+    category: str
+    content: str
+    created_at: float
+    hit_count: int
+    last_hit: float | None
+
+
 class SessionStore:
-    """sessions / messages / chat_state / messages_fts 的封装。"""
+    """sessions / messages / chat_state / messages_fts / memories 的封装。"""
 
     def __init__(self, db_path: Path | str = DEFAULT_DB_PATH) -> None:
         self.db_path = str(db_path)
@@ -902,6 +971,65 @@ class SessionStore:
                 "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?", (session_id,)
             ).fetchone()
         return int(row["c"])
+
+    # -- 长期记忆 --
+
+    @staticmethod
+    def _to_memory(row: sqlite3.Row) -> Memory:
+        return Memory(
+            id=row["id"], chat_id=row["chat_id"], category=row["category"],
+            content=row["content"], created_at=row["created_at"],
+            hit_count=row["hit_count"], last_hit=row["last_hit"],
+        )
+
+    def add_memory(self, chat_id: str, category: str, content: str) -> int:
+        """写入长期记忆，返回行 id。同 chat 同文去重：已有则刷新 created_at（类别跟随最新），不新增。"""
+        now = time.time()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM memories WHERE chat_id = ? AND content = ?",
+                (chat_id, content),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "UPDATE memories SET created_at = ?, category = ? WHERE id = ?",
+                    (now, category, row["id"]),
+                )
+                return int(row["id"])
+            cur = conn.execute(
+                "INSERT INTO memories (chat_id, category, content, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (chat_id, category, content, now),
+            )
+            return int(cur.lastrowid)
+
+    def list_memories(self, chat_id: str, limit: int = 30) -> list[Memory]:
+        """该 chat 的长期记忆，按创建时间倒序（新的在前；id 兜底同时间戳次序）。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE chat_id = ?"
+                " ORDER BY created_at DESC, id DESC LIMIT ?",
+                (chat_id, limit),
+            ).fetchall()
+        return [self._to_memory(r) for r in rows]
+
+    def delete_memory(self, chat_id: str, keyword: str) -> int:
+        """按内容模糊匹配删除，返回删了几条。keyword 经转义，% _ 等通配符不生效。"""
+        like = f"%{_like_escape(keyword)}%"
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM memories WHERE chat_id = ? AND content LIKE ? ESCAPE '\\'",
+                (chat_id, like),
+            )
+            return cur.rowcount
+
+    def touch_memory(self, memory_id: int) -> None:
+        """命中计数 +1 并记时间（记忆被用上时调用）。"""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE memories SET hit_count = hit_count + 1, last_hit = ? WHERE id = ?",
+                (time.time(), memory_id),
+            )
 
     # -- 跨会话召回（FTS5）--
 

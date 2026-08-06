@@ -145,7 +145,8 @@ def to_anthropic_payload(kwargs: dict[str, Any]) -> dict[str, Any]:
 
     差异处理：system 提成顶层参数；多模态 image_url(data:base64) → image block；
     连续同角色消息合并（Anthropic 要求角色交替）；max_tokens 必填（缺省 8192）。
-    response_format / extra_body（reasoning_effort）是 OpenAI 系参数，不能原样发送。
+    response_format / extra_body 是 OpenAI 系参数，不能原样发送；Kimi 的
+    Anthropic 兼容端点接受顶层 ``reasoning_effort``，这里显式翻译。
     JSON object 模式会转换成 system 约束，避免 Anthropic 兼容端静默失去格式要求。
     """
     system_parts: list[str] = []
@@ -204,6 +205,9 @@ def to_anthropic_payload(kwargs: dict[str, Any]) -> dict[str, Any]:
         "messages": merged,
         "max_tokens": kwargs.get("max_tokens") or 8192,
     }
+    reasoning_effort = kwargs.get("reasoning_effort")
+    if reasoning_effort in {"low", "high", "max"}:
+        payload["reasoning_effort"] = reasoning_effort
     if system_parts:
         payload["system"] = "\n\n".join(system_parts)
     if kwargs.get("stream"):
@@ -408,11 +412,13 @@ class KimiClient:
         anthropic = provider.protocol == "anthropic"
         client = None if anthropic else self._client_for(provider)
         if not anthropic:
-            # OpenAI 兼容网关（free-tokens）对显式 max_tokens 会按 ~16384 封顶，
+            # 已实测的 free-tokens 网关对显式 max_tokens 会按 ~16384 封顶，
             # 不传时网关默认预算反而更大（实测同日：不传 21175 chunks 完整出稿，
             # 传 16384/32768 均在 ~16381 chunks 处截断，reasoning 烧光正文为零）。
-            # 输出预算因此只对 Anthropic 协议（max_tokens 必填）生效。
-            kwargs = {k: v for k, v in kwargs.items() if k != "max_tokens"}
+            # 这个兼容只针对该 provider；其它 OpenAI 兼容端点必须收到尺寸预算，
+            # 不能因为一个网关的副作用把全体 provider 的输出上限都静默删除。
+            if provider.name == "free-tokens":
+                kwargs = {k: v for k, v in kwargs.items() if k != "max_tokens"}
             kwargs["messages"] = _strip_cache_break(kwargs.get("messages") or [])
         last_err: Exception | None = None
         for attempt in range(self.settings.kimi_max_retries + 1):
@@ -474,15 +480,23 @@ class KimiClient:
         heavy: bool = False,
         json_mode: bool = False,
         low_reasoning: bool = False,
+        reasoning_effort: str | None = None,
         max_tokens: int | None = None,
         candidates: list[ModelCandidate] | tuple[ModelCandidate, ...] | None = None,
     ) -> ChatResult:
         """只调用用户当前选择，返回完整结果（含 reasoning 与 provider/model）。
 
-        low_reasoning：以 extra_body 传 reasoning_effort=low——部分思考型模型在复杂长 prompt 上会把默认 max_tokens
-        全烧在 reasoning 导致正文为空（实测 free-tokens 网关），压低思考后 ~20s 出稿。
+        reasoning_effort：显式选择 low/high/max；OpenAI 兼容端走 extra_body，
+        Anthropic 兼容端翻译成顶层参数。``low_reasoning`` 仅为旧调用兼容，
+        新代码应把 low 只用于格式纠错等降级重试，而不是复杂任务首轮。
         max_tokens：显式抬输出预算（网关默认偏小，长骨架会被截断）。
         """
+        if reasoning_effort is not None and reasoning_effort not in {"low", "high", "max"}:
+            raise ValueError("reasoning_effort 必须是 low/high/max 或 None")
+        if low_reasoning:
+            if reasoning_effort not in (None, "low"):
+                raise ValueError("low_reasoning 与 reasoning_effort 冲突")
+            reasoning_effort = "low"
         configured = (
             list(candidates) if candidates is not None
             else list(self.settings.routing_heavy)
@@ -507,8 +521,11 @@ class KimiClient:
         kwargs: dict[str, Any] = {"model": cand.model, "messages": messages}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
-        if low_reasoning:
-            kwargs["extra_body"] = {"reasoning_effort": "low"}
+        if reasoning_effort:
+            if provider.protocol == "anthropic":
+                kwargs["reasoning_effort"] = reasoning_effort
+            else:
+                kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         # 流式与业务任务类型解耦：显式 heavy 仍然流式，任何长输入也自动
@@ -554,12 +571,15 @@ class KimiClient:
         heavy: bool = False,
         json_mode: bool = False,
         low_reasoning: bool = False,
+        reasoning_effort: str | None = None,
         max_tokens: int | None = None,
         candidates: list[ModelCandidate] | tuple[ModelCandidate, ...] | None = None,
     ) -> str:
         """通用对话，只返回正文（reasoning 丢弃，需要时用 chat_full）。"""
         return self.chat_full(messages, heavy=heavy, json_mode=json_mode,
-                              low_reasoning=low_reasoning, max_tokens=max_tokens,
+                              low_reasoning=low_reasoning,
+                              reasoning_effort=reasoning_effort,
+                              max_tokens=max_tokens,
                               candidates=candidates).content
 
     def frozen(self) -> "FrozenKimiClient":

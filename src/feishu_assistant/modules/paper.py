@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import socket
 import threading
@@ -59,7 +60,7 @@ from ..feishu.bitable import (
 )
 from ..feishu.docx import DocxClient, DocxError, fit_image_size, image_dimensions  # noqa: F401  (fit/image 尺寸助手经本模块 re-export)
 from ..feishu.drive import DriveClient, DriveError
-from ..kimi import KimiClient, KimiError, get_llm_stats
+from ..kimi import CACHE_BREAK, KimiClient, KimiError, get_llm_stats
 from ..lifecycle import LifecycleError, PaperCache, PaperCacheEntry
 from ..pdf import PdfParseError, parse_pdf, pdf_page_count
 from ..store import (
@@ -73,6 +74,11 @@ from ..vectors import PaperVectorIndex
 from .figures import FigureAsset, load_figure_assets
 from .formulas import load_formula_assets
 from .reading import ReadingEngine, ReadingError, ReadingResult, classify_direction
+from .reading_evidence import (
+    paper_budget_profile,
+    paper_size_tier,
+    split_markdown_sections,
+)
 from .reading_v9 import V9ReadingEngine
 from .reading_workflow import ReadingWorkspace
 from .status import StatusMessenger, TaskCard
@@ -81,7 +87,13 @@ logger = logging.getLogger("feishu_assistant.paper")
 
 PAPERS_DIR = PROJECT_ROOT / "data" / "papers"
 
-DEFAULT_MAX_INPUT_CHARS = 60_000  # 追问上下文预算；精读正文不再用这个值截尾
+
+def _card_state_path(dedup_key: str) -> Path:
+    """任务卡接管状态文件：按查重键一任务一份（安全文件名）。"""
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in dedup_key)
+    return PROJECT_ROOT / "data" / "status-cards" / f"{safe}.json"
+
+DEFAULT_MAX_INPUT_CHARS = 60_000  # truncate_markdown 默认预算；追问上下文已按论文尺寸分路（FOLLOWUP_CONTEXT_CHARS）
 DOWNLOAD_TIMEOUT = 120
 METADATA_TIMEOUT = 15
 
@@ -90,6 +102,11 @@ METADATA_TIMEOUT = 15
 # 精读工作区检查点（逐阶段复用）+ 在飞锁串行 + 版本号锁内分配，job 整体幂等，
 # 重跑是"续跑"而非"从头再来"。
 TRANSIENT_RETRY_BACKOFFS = (120, 300, 600)
+# 长候模式：ladder 耗尽后按固定间隔继续重试，次数封顶才放弃（按次数不按墙钟，
+# 测试可复现）——实证教训：真实断网可持续 30 分钟以上（08-04/08-05 两次），
+# 17 分钟的 ladder 扛不住。
+TRANSIENT_LONG_WAIT_INTERVAL = 600  # 长候每 10 分钟重试一次
+TRANSIENT_LONG_WAIT_MAX_ATTEMPTS = 6  # 最多 6 次（≈再撑 60 分钟）
 
 # ---------------------------------------------------------------------------
 # arXiv 入口识别与下载
@@ -294,6 +311,10 @@ def split_sections(md: str) -> list[tuple[str, str]]:
     return sections
 
 
+def _trunc(text: str, budget: int) -> str:
+    return text if len(text) <= budget else text[: budget - 1] + "…"
+
+
 def truncate_markdown(md: str, max_chars: int = DEFAULT_MAX_INPUT_CHARS) -> str:
     """把论文 markdown 压到 max_chars 以内。确定性策略，逐级收紧。"""
     if len(md) <= max_chars:
@@ -430,6 +451,72 @@ def _release_label(metadata: dict[str, Any]) -> str:
     return _V9_RELEASE_LABELS.get(status, status or "精读文档已生成")
 
 
+def _unresolved_fact_notices(metadata: dict[str, Any], *, limit: int = 3) -> list[str]:
+    """把未自动修订的 P2 事实问题压缩成用户可见提醒。"""
+    raw = metadata.get("unresolved_p2_fact_issues") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    notices: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        problem = re.sub(r"\s+", " ", str(item.get("problem") or "")).strip()
+        outcome = re.sub(r"\s+", " ", str(item.get("required_outcome") or "")).strip()
+        text = problem or outcome
+        if not text:
+            continue
+        if problem and outcome and outcome not in problem:
+            text += f"；建议：{outcome}"
+        notices.append(text[:260])
+        if len(notices) >= limit:
+            break
+    return notices
+
+
+def _result_markdown(metadata: dict[str, Any], doc_url: str, arxiv_id: str,
+                     archived: bool, *, timing_text: str = "") -> str:
+    """并入任务卡定格帧的结果区 markdown（替代原单独结果卡）。
+    紧凑完整：TL;DR + 发布状态/降级警示 + 核心贡献 + 文档链接 + 计时 + 归档提示。"""
+    parts: list[str] = ["---", "**📄 精读结果**"]
+    tldr = str(metadata.get("tldr") or "").strip()
+    if tldr:
+        parts.append(f"**TL;DR**：{tldr}")
+    release_status = str(metadata.get("release_status") or "").strip()
+    if release_status in _V9_RELEASE_LABELS and release_status != "verified_final":
+        parts.append(f"⚠️ **V9 发布状态：{_V9_RELEASE_LABELS[release_status]}**"
+                     "（系统没有合成终审通过；详情见文档顶部）")
+    final_degraded = str(metadata.get("final_review_degraded") or "").strip()
+    if final_degraded:
+        items = [x.strip() for x in final_degraded.split("；") if x.strip()][:3]
+        parts.append("⚠️ **终审未全部通过**：" + "；".join(items))
+    degraded_sections = metadata.get("degraded_sections") or []
+    if degraded_sections:
+        parts.append("⚠️ **节级批注**（全文保留，详见文档内横幅）："
+                     + "、".join(str(n) for n in degraded_sections[:4]))
+    fact_notices = _unresolved_fact_notices(metadata)
+    if fact_notices:
+        parts.append("⚠️ **未自动修订的事实提醒**：" + "；".join(
+            f"{i}. {notice}" for i, notice in enumerate(fact_notices, 1)
+        ))
+    contributions = metadata.get("contributions") or []
+    if contributions:
+        parts.append("**核心贡献**：" + "；".join(
+            f"{i}. {c}" for i, c in enumerate(contributions[:3], 1)))
+    links: list[str] = []
+    if doc_url:
+        links.append(f"📖 [打开精读文档]({doc_url})")
+    if arxiv_id:
+        links.append(f"🔗 [arXiv:{arxiv_id}]({arxiv_abs_url(arxiv_id)})")
+    if links:
+        parts.append(" · ".join(links))
+    if timing_text:
+        parts.append(f"⏱ {timing_text}")
+    archive_note = ("📚 论文库已归档 · 可直接追问本文细节" if archived
+                    else "⚠️ 论文库归档未成功（文档仍可用，可检查后重试归档）")
+    parts.append(archive_note)
+    return "\n".join(parts)
+
+
 def build_result_card(
     metadata: dict[str, Any],
     doc_url: str,
@@ -457,6 +544,7 @@ def build_result_card(
         ))
     final_degraded = str(metadata.get("final_review_degraded") or "").strip()
     degraded_sections = metadata.get("degraded_sections") or []
+    fact_notices = _unresolved_fact_notices(metadata)
     if final_degraded or degraded_sections:
         warn_lines: list[str] = []
         if final_degraded:
@@ -470,6 +558,12 @@ def build_result_card(
             warn_lines.append("**节级批注**（全文保留，详见文档内横幅）：")
             warn_lines.extend(f"- {name}" for name in degraded_sections[:6])
         elements.append(_md_element("⚠️ " + "\n".join(warn_lines)))
+    if fact_notices:
+        elements.append(_md_element(
+            "⚠️ **未自动修订的事实提醒**\n" + "\n".join(
+                f"{i}. {notice}" for i, notice in enumerate(fact_notices, 1)
+            )
+        ))
     if contrib_text:
         elements.append(_md_element(f"**核心贡献**\n{contrib_text}"))
     if arxiv_id:
@@ -489,6 +583,7 @@ def build_result_card(
         })
     degraded = bool(
         metadata.get("final_review_degraded") or metadata.get("degraded_sections")
+        or fact_notices
         or (release_status and release_status != "verified_final")
     )
     core_failed = bool(
@@ -528,22 +623,319 @@ def build_error_card(paper_label: str, reason: str, suggestion: str) -> dict:
 # ---------------------------------------------------------------------------
 
 FOLLOWUP_KEYWORDS = (
-    "这篇", "本文", "论文", "作者", "第", "图", "表", "公式", "章节",
+    "这篇", "本文", "论文", "作者", "公式", "章节",
     "方法", "实验", "结论", "贡献", "局限", "指标", "数据", "结果", "框架",
-    "怎么算", "为什么", "什么意思", "解释", "上面", "刚才", "前文", "原文",
+    "上面", "刚才", "前文", "原文",
+)
+
+# 单字「第/图/表」没有独立截胡权：它们在「第一个」「表面理解」「图灵」等普通
+# 表达里过于常见。只保留明确的论文结构词组。
+FOLLOWUP_PATTERNS = (
+    re.compile(r"第\s*[0-9一二三四五六七八九十百]+\s*(?:章|节|部分|小节)"),
+    re.compile(r"(?:图表|表格|对比表|数据表|这张图|那张图|上图|下图|流程图|架构图|示意图)"),
+    re.compile(r"(?:图|表)\s*(?:[0-9]+|[A-Z])(?:[.\-][0-9A-Z]+)?", re.IGNORECASE),
 )
 
 
 def looks_like_followup(text: str) -> bool:
     """是否像针对最近精读论文的追问（明确关键词或引用前文）。"""
-    return any(kw in text for kw in FOLLOWUP_KEYWORDS)
+    return any(kw in text for kw in FOLLOWUP_KEYWORDS) \
+        or any(pattern.search(text) for pattern in FOLLOWUP_PATTERNS)
 
 
 _FOLLOWUP_SYSTEM = (
     "你是论文精读助手的追问模式。用户刚精读完一篇论文，现在针对原文追问细节。"
-    "回答要求：严格基于给出的论文全文，标注相关章节位置；原文没有的信息明说"
-    "「原文未提及」，不要编造；中文回答，简洁直接，先结论后展开。"
+    "回答要求：严格基于给出的论文内容（全文或按问题检索到的相关章节），标注相关章节位置；"
+    "原文没有的信息明说「原文未提及」，不要编造；用户用「它/第二个/再详细点」这类指代时，"
+    "参考对话记录承接上文；中文回答，简洁直接，先结论后展开。"
+    "如果论文内容区标明『检索未命中』，不得根据章节目录猜答案；应明确说没有定位到可靠原文块，"
+    "并请用户补充术语、章节、图表编号或更具体的问题。"
 )
+
+# 兼容旧测试/外部导入的缺省值。正式追问从 ``paper_budget_profile`` 取该篇
+# 论文自己的检索预算，不再给所有长文统一 160k，也不再在低置信时盲截全文。
+FOLLOWUP_CONTEXT_CHARS = 200_000    # 追问论文内容区总预算（含检索回退截断）
+FOLLOWUP_RETRIEVAL_CHARS = 160_000  # 长文检索章节包预算：总预算 80%，留 20% 给 prompt 框架
+FOLLOWUP_HISTORY_ROUNDS = 5         # 追问携带最近 N 轮问答
+FOLLOWUP_HISTORY_CHARS = 2_000      # 历史区总预算（防挤占论文内容）
+
+# 无绑定会话时的论文关联门槛：向量距离 <0.2 才允许直接选；0.2~0.45
+# 只作为候选排序信号，必须让用户确认。中文语义主要依赖 TLDR+章节标题的
+# 字符 bigram 覆盖率，不让英文向量模型以一个宽松阈值替用户拍板。
+FOLLOWUP_VECTOR_DIRECT_DISTANCE = 0.20
+FOLLOWUP_VECTOR_DIRECT_MARGIN = 0.05
+FOLLOWUP_LEXICAL_DIRECT_SCORE = 0.28
+FOLLOWUP_LEXICAL_DIRECT_MARGIN = 0.10
+FOLLOWUP_CANDIDATE_LIMIT = 8
+FOLLOWUP_CHOICE_TTL_SECONDS = 10 * 60
+
+_FOLLOWUP_QUERY_NOISE_RE = re.compile(
+    r"这篇|本文|这篇论文|论文|作者|上面|刚才|前文|原文|请|帮我|麻烦|"
+    r"怎么做到|怎么算|为什么|什么意思|解释一下|解释|再讲讲|详细点|具体说说|"
+    r"[的了呢吗\s，。！？、,.!?：:；;（）()【】\[\]‘’“”《》%]"
+)
+
+
+def _association_query(text: str) -> str:
+    """去掉追问套话，只留下能区分论文的主题词。"""
+    return _FOLLOWUP_QUERY_NOISE_RE.sub("", text).lower()
+
+
+def _association_score(question: str, association_text: str) -> float:
+    query = _association_query(question)
+    haystack = re.sub(r"\s+", "", association_text).lower()
+    return _question_match(query, haystack)
+
+
+def _paper_association_text(title: str, tldr: str, markdown: str) -> str:
+    """构造确定性关联文本：标题 + 中文 TLDR + H1~H3 小标题。
+
+    正文不整段塞入，避免长综述凭通用词覆盖率碾压主题明确的短论文。
+    """
+    headings = [heading for heading, _ in split_markdown_sections(markdown)]
+    parts = [title.strip(), tldr.strip(), *headings[:120]]
+    return "\n".join(part for part in parts if part)[:12_000]
+
+
+def _question_match(question: str, text: str) -> float:
+    """问题对章节的字符 bigram 覆盖率（0~1）：检索打分的轻量近似。"""
+    q = re.sub(r"\s+", "", question)
+    t = re.sub(r"\s+", "", text)
+    if not q or not t:
+        return 0.0
+    qg = {q[i:i + 2] for i in range(len(q) - 1)} or {q}
+    tg = {t[i:i + 2] for i in range(len(t) - 1)} or {t}
+    return len(qg & tg) / max(1, len(qg))
+
+
+# 长文追问永远保留的导航章节：摘要/引言/结论（「文首」preamble 同理必带）
+_ALWAYS_KEEP_SECTION_RE = re.compile(
+    r"abstract|introduction|conclusion|摘要|引言|结论", re.IGNORECASE
+)
+
+_RETRIEVAL_CHUNK_CHARS = 6_000
+_RETRIEVAL_NEIGHBOR_CHARS = 1_000
+_RETRIEVAL_MAX_PRIMARY_HITS = 6
+_RETRIEVAL_GENERIC_TERMS = {
+    "论文", "本文", "作者", "方法", "实验", "结果", "结论", "问题", "怎么", "为什么",
+    "paper", "method", "experiment", "result", "results", "conclusion", "author",
+}
+
+
+@dataclass(frozen=True)
+class _RetrievalChunk:
+    chunk_id: str
+    section_index: int
+    passage_index: int
+    passage_count: int
+    title: str
+    text: str
+
+    @property
+    def location(self) -> str:
+        if self.passage_count <= 1:
+            return self.title
+        return f"{self.title} · 块 {self.passage_index}/{self.passage_count}"
+
+
+@dataclass(frozen=True)
+class _RetrievalPacket:
+    text: str | None
+    omitted_titles: tuple[str, ...]
+    selected_locations: tuple[str, ...]
+    confidence: float
+    reason: str = ""
+
+
+def _split_retrieval_passages(md: str) -> list[_RetrievalChunk]:
+    """把 H1~H3 章节继续切成段落级检索块，答案在章节深处也能命中。"""
+    chunks: list[_RetrievalChunk] = []
+    for section_index, (title, section) in enumerate(split_markdown_sections(md)):
+        paragraphs = [part for part in re.split(r"(?=\n\s*\n)", section) if part.strip()]
+        passages: list[str] = []
+        current = ""
+        for paragraph in paragraphs:
+            if current and len(current) + len(paragraph) > _RETRIEVAL_CHUNK_CHARS:
+                passages.append(current)
+                current = ""
+            while len(paragraph) > _RETRIEVAL_CHUNK_CHARS:
+                if current:
+                    passages.append(current)
+                    current = ""
+                passages.append(paragraph[:_RETRIEVAL_CHUNK_CHARS])
+                paragraph = paragraph[_RETRIEVAL_CHUNK_CHARS - _RETRIEVAL_NEIGHBOR_CHARS:]
+            current += paragraph
+        if current:
+            passages.append(current)
+        passages = passages or [section]
+        count = len(passages)
+        for passage_index, text in enumerate(passages, 1):
+            chunks.append(_RetrievalChunk(
+                chunk_id=f"followup-{section_index + 1:03d}-{passage_index:03d}",
+                section_index=section_index,
+                passage_index=passage_index,
+                passage_count=count,
+                title=title,
+                text=text,
+            ))
+    return chunks
+
+
+def _retrieval_terms(question: str) -> list[str]:
+    cleaned = _association_query(question)
+    terms: list[str] = []
+    terms.extend(re.findall(r"[a-z][a-z0-9_.+/-]{1,}|\d+(?:\.\d+)?", cleaned))
+    for run in re.findall(r"[一-鿿]{2,}", cleaned):
+        if len(run) <= 10:
+            terms.append(run)
+        for size in (2, 3, 4):
+            terms.extend(run[i:i + size] for i in range(max(0, len(run) - size + 1)))
+    return list(dict.fromkeys(term for term in terms if term not in _RETRIEVAL_GENERIC_TERMS))
+
+
+def _retrieval_navigation(md: str, *, budget: int) -> str:
+    """低置信时只给摘要/结论与章节目录，不用全文前缀冒充检索结果。"""
+    sections = [(title, text) for title, text in split_markdown_sections(md) if text.strip()]
+    parts = ["## 检索状态\n当前问题没有命中足够可靠的原文块；以下只提供摘要/结论和章节导航。"]
+    used = len(parts[0])
+    for title, text in sections:
+        if title != "文首" and not _ALWAYS_KEEP_SECTION_RE.search(title):
+            continue
+        segment = f"## {title}\n{_trunc(text, 8_000)}"
+        if used + len(segment) > budget:
+            continue
+        parts.append(segment)
+        used += len(segment)
+    directory = "## 章节目录\n" + "\n".join(f"- {title}" for title, _ in sections[:160])
+    if used + len(directory) <= budget:
+        parts.append(directory)
+    return "\n\n".join(parts)
+
+
+def _retrieve_sections_info(
+    md: str,
+    question: str,
+    budget: int = FOLLOWUP_RETRIEVAL_CHARS,
+) -> _RetrievalPacket:
+    """块级混合检索：全文词项/数字 + IDF + 字符 bigram + 标题加权。
+
+    只在候选达到置信门槛时返回原文块；命中块会带同章节相邻块补足上下文。
+    低置信返回 ``text=None``，调用方必须 fail closed，不能回退盲截全文。
+    """
+    if type(budget) is not int or budget <= 0:
+        raise ValueError("budget 必须是正整数")
+    chunks = _split_retrieval_passages(md)
+    if len(chunks) <= 1:
+        return _RetrievalPacket(None, (), (), 0.0, "论文没有可检索的章节/段落结构")
+    terms = _retrieval_terms(question)
+    normalized_query = _association_query(question) or re.sub(r"\s+", "", question).lower()
+    if not terms and len(normalized_query) < 2:
+        return _RetrievalPacket(None, (), (), 0.0, "问题缺少可区分的检索词")
+
+    doc_freq = {
+        term: sum(
+            term in f"{chunk.title}\n{chunk.text}".casefold() for chunk in chunks
+        )
+        for term in terms
+    }
+    term_weight = {
+        term: 1.0 + math.log((len(chunks) + 1) / (doc_freq[term] + 1))
+        for term in terms
+    }
+    total_weight = sum(term_weight.values()) or 1.0
+    scored: list[tuple[float, float, float, bool, int]] = []
+    for index, chunk in enumerate(chunks):
+        title = chunk.title.casefold()
+        text = chunk.text.casefold()
+        matched = sum(
+            weight for term, weight in term_weight.items() if term in title or term in text
+        )
+        title_matched = sum(
+            weight for term, weight in term_weight.items() if term in title
+        )
+        coverage = matched / total_weight
+        title_coverage = title_matched / total_weight
+        bigram = _question_match(normalized_query, f"{title}\n{text}")
+        exact = bool(normalized_query and len(normalized_query) >= 3
+                     and normalized_query in re.sub(r"\s+", "", f"{title}\n{text}"))
+        score = coverage + title_coverage * 0.9 + bigram * 0.35 + (0.45 if exact else 0.0)
+        scored.append((score, coverage, bigram, exact, index))
+    scored.sort(reverse=True)
+    top_score, top_coverage, top_bigram, top_exact, _ = scored[0]
+    confidence = min(1.0, top_score / 1.8)
+    if not (top_exact or top_coverage >= 0.24 or top_bigram >= 0.16):
+        omitted = tuple(dict.fromkeys(chunk.title for chunk in chunks))
+        return _RetrievalPacket(None, omitted, (), confidence, "候选与问题重叠不足")
+
+    cutoff = max(0.20, top_score * 0.52)
+    primary = [
+        index for score, coverage, bigram, exact, index in scored
+        if score >= cutoff and (exact or coverage >= 0.18 or bigram >= 0.12)
+    ][:_RETRIEVAL_MAX_PRIMARY_HITS]
+    selected_priority: list[int] = list(primary)
+    # 只给最强命中补相邻块，避免“精确检索”再次膨胀成半篇全文。
+    for index in primary[:3]:
+        chunk = chunks[index]
+        for neighbor in (index - 1, index + 1):
+            if 0 <= neighbor < len(chunks) and chunks[neighbor].section_index == chunk.section_index:
+                selected_priority.append(neighbor)
+    anchors = [
+        i for i, chunk in enumerate(chunks)
+        if (chunk.title == "文首" or _ALWAYS_KEEP_SECTION_RE.search(chunk.title))
+        and chunk.passage_index == 1
+    ]
+    selected_priority.extend(anchors)
+    selected_priority = list(dict.fromkeys(selected_priority))
+
+    chosen: set[int] = set()
+    used = 0
+    for index in selected_priority:
+        chunk = chunks[index]
+        segment = f"--- RETRIEVED {chunk.chunk_id} · {chunk.location} ---\n{chunk.text}"
+        if used + len(segment) > budget:
+            continue
+        chosen.add(index)
+        used += len(segment) + 2
+    if not any(index in chosen for index in primary):
+        omitted = tuple(dict.fromkeys(chunk.title for chunk in chunks))
+        return _RetrievalPacket(None, omitted, (), confidence, "命中块无法装入当前预算")
+
+    ordered = sorted(chosen)
+    text = "\n\n".join(
+        f"--- RETRIEVED {chunks[index].chunk_id} · {chunks[index].location} ---\n"
+        f"{chunks[index].text}"
+        for index in ordered
+    )
+    represented_sections = {chunks[index].section_index for index in ordered}
+    omitted_titles = tuple(dict.fromkeys(
+        chunk.title for chunk in chunks if chunk.section_index not in represented_sections
+    ))
+    return _RetrievalPacket(
+        text=text,
+        omitted_titles=omitted_titles,
+        selected_locations=tuple(chunks[index].location for index in ordered),
+        confidence=confidence,
+    )
+
+
+def _retrieve_sections(md: str, question: str,
+                       budget: int = FOLLOWUP_RETRIEVAL_CHARS) -> tuple[str | None, list[str]]:
+    """兼容旧调用；新代码使用 ``_retrieve_sections_info`` 的诊断信息。"""
+    packet = _retrieve_sections_info(md, question, budget)
+    return packet.text, list(packet.omitted_titles)
+
+
+def _chat_with_budget(client: Any, messages: list[dict[str, str]], **kwargs: Any) -> str:
+    """给追问传尺寸输出预算；窄接口测试桩只在明确拒绝关键字时兼容降级。"""
+    try:
+        return client.chat(messages, **kwargs)
+    except TypeError as exc:
+        message = str(exc).casefold()
+        if not any(token in message for token in (
+            "unexpected keyword", "got an unexpected keyword", "keyword-only argument",
+        )):
+            raise
+        return client.chat(messages, heavy=bool(kwargs.get("heavy", False)))
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +1034,10 @@ class PaperReadingService:
         # 精读完成后的回调（main.py 注入 session_service.bind_paper_session）：
         # 签名 (context, title, arxiv_id) -> str | None，返回给用户的提示语
         self.on_done: Any = None
+        # 无绑定会话且关联不唯一时，保存「1/2」候选，下一条短回复可确定性选中。
+        # 只存内存且 10 分钟过期：它是交互便利，不是业务事实源。
+        self._followup_choices: dict[str, tuple[float, list[Any]]] = {}
+        self._followup_choice_lock = threading.Lock()
         self.bitable_dao: BitableDAO | None = (
             BitableDAO(lark_client, settings.bitable_app_token, settings.bitable_tables)
             if settings.bitable_ready()
@@ -735,24 +1131,172 @@ class PaperReadingService:
 
     # ---- 追问 ----
 
+    @staticmethod
+    def _legacy_association_text(paper: Any) -> str:
+        """旧记录没有 association_text 时，从标题/摘要节/章节标题现场补一个。"""
+        sections = split_markdown_sections(str(paper.markdown or ""))
+        headings = [title for title, _ in sections][:120]
+        synopsis = ""
+        for title, body in sections:
+            if re.search(r"abstract|摘要|tldr|tl;dr|核心结论|一句话", title, re.IGNORECASE):
+                synopsis = re.sub(r"^#{1,3}\s+[^\n]+\n?", "", body).strip()[:1_200]
+                break
+        return "\n".join(part for part in [paper.title, synopsis, *headings] if part)[:12_000]
+
+    def _vector_distances(self, text: str, candidates: list[Any]) -> dict[str, float]:
+        """只接收当前 chat 候选里的向量命中，杜绝全库检索跨 chat 串文。"""
+        if self.vector_index is None:
+            return {}
+        try:
+            hits = self.vector_index.search(text, top_k=min(3, len(candidates)))
+        except Exception as exc:
+            logger.warning("追问向量匹配失败（改用确定性候选）：%s", exc)
+            return {}
+        allowed = {str(p.arxiv_id): p for p in candidates}
+        return {
+            str(arxiv_id): float(distance)
+            for arxiv_id, _title, distance in hits
+            if str(arxiv_id) in allowed
+        }
+
+    def _remember_followup_choices(self, chat_id: str, papers: list[Any]) -> str:
+        choices = papers[:2]
+        with self._followup_choice_lock:
+            self._followup_choices[chat_id] = (time.time(), choices)
+        lines = ["我不能确定你指的是哪篇，避免硬关联："]
+        for index, paper in enumerate(choices, 1):
+            lines.append(f"{index}. 《{paper.title}》")
+        lines.append("请直接回复 1 或 2，我再按你选的论文回答。")
+        return "\n".join(lines)
+
+    def _consume_followup_choice(self, chat_id: str, text: str) -> Any | None:
+        """消费上一轮候选；支持 1/2、A/B、第一篇/第二篇或标题片段。"""
+        with self._followup_choice_lock:
+            pending = self._followup_choices.get(chat_id)
+            if pending is None:
+                return None
+            created_at, papers = pending
+            if time.time() - created_at > FOLLOWUP_CHOICE_TTL_SECONDS:
+                self._followup_choices.pop(chat_id, None)
+                return None
+
+            normalized = re.sub(r"[\s，。！？、,.!?：:；;（）()]", "", text).lower()
+            index: int | None = None
+            if normalized in {"1", "a", "第一个", "第一篇", "选1", "选a"}:
+                index = 0
+            elif normalized in {"2", "b", "第二个", "第二篇", "选2", "选b"}:
+                index = 1
+            else:
+                for i, paper in enumerate(papers):
+                    title = re.sub(r"\s+", "", str(paper.title)).lower()
+                    if len(normalized) >= 2 and (normalized in title or title in normalized):
+                        index = i
+                        break
+                    if str(paper.arxiv_id) and str(paper.arxiv_id).lower() in normalized:
+                        index = i
+                        break
+
+            if index is None or index >= len(papers):
+                # 任何非确认输入都取消旧候选，避免若干轮后一个孤立的「1」误触发。
+                self._followup_choices.pop(chat_id, None)
+                return None
+            self._followup_choices.pop(chat_id, None)
+            return papers[index]
+
+    def _followup_paper(self, chat_id: str, text: str) -> tuple[Any | None, str | None]:
+        """无绑定会话的追问关联：同 chat 候选 + bigram + 严格向量门槛。
+
+        返回 (论文, None) 表示可直接回答；(None, 提示) 表示关联不唯一，等待用户
+        1/2 确认；(None, None) 表示时间窗内没有论文。
+        """
+        candidates = self.store.recent_papers(
+            chat_id, within_hours=FOLLOWUP_WINDOW_HOURS, limit=FOLLOWUP_CANDIDATE_LIMIT
+        )
+        if not candidates:
+            return None, None
+        if len(candidates) == 1:
+            return candidates[0], None
+
+        distances = self._vector_distances(text, candidates)
+        ranked: list[tuple[Any, float, float | None]] = []
+        for paper in candidates:
+            association_text = str(getattr(paper, "association_text", "") or "") \
+                or self._legacy_association_text(paper)
+            lexical = _association_score(text, association_text)
+            ranked.append((paper, lexical, distances.get(str(paper.arxiv_id))))
+
+        # 中文 bigram 是主排序；距离只在覆盖率相同附近时辅助排候选顺序。
+        ranked.sort(key=lambda item: (
+            item[1],
+            -(item[2] if item[2] is not None else 9.0),
+            item[0].created_at,
+        ), reverse=True)
+        best, best_lexical, best_distance = ranked[0]
+        second_lexical = ranked[1][1]
+
+        if best_lexical >= FOLLOWUP_LEXICAL_DIRECT_SCORE \
+                and best_lexical - second_lexical >= FOLLOWUP_LEXICAL_DIRECT_MARGIN:
+            logger.info(
+                "追问 bigram 直接关联：《%s》（覆盖率 %.3f，次选 %.3f）",
+                best.title, best_lexical, second_lexical,
+            )
+            return best, None
+
+        vector_ranked = sorted(
+            (item for item in ranked if item[2] is not None), key=lambda item: item[2]
+        )
+        if vector_ranked:
+            vector_best, _lexical, vector_distance = vector_ranked[0]
+            runner_distance = vector_ranked[1][2] if len(vector_ranked) > 1 else None
+            if vector_distance is not None and vector_distance < FOLLOWUP_VECTOR_DIRECT_DISTANCE \
+                    and (runner_distance is None
+                         or runner_distance - vector_distance >= FOLLOWUP_VECTOR_DIRECT_MARGIN):
+                logger.info(
+                    "追问向量严格关联：《%s》（距离 %.3f）",
+                    vector_best.title, vector_distance,
+                )
+                return vector_best, None
+
+        logger.info(
+            "追问关联不唯一：top《%s》bigram=%.3f vector=%s，转用户确认",
+            best.title, best_lexical,
+            f"{best_distance:.3f}" if best_distance is not None else "none",
+        )
+        return None, self._remember_followup_choices(
+            chat_id, [paper for paper, _score, _distance in ranked]
+        )
+
     def answer_followup(self, text: str, context: MessageContext | None) -> str | None:
         """命中追问状态则带全文上下文回答；否则返回 None（交给自由对话）。"""
         if context is None:
             return None
-        paper = self.store.latest_paper(context.chat_id, within_hours=FOLLOWUP_WINDOW_HOURS)
-        if paper is None or not looks_like_followup(text):
+        paper = self._consume_followup_choice(context.chat_id, text)
+        if paper is None and not looks_like_followup(text):
+            return None
+        if paper is None:
+            paper, prompt = self._followup_paper(context.chat_id, text)
+            if prompt is not None:
+                return prompt
+        if paper is None:
             return None
         logger.info("命中追问：chat=%s 论文《%s》问题=%s", context.chat_id, paper.title, text[:40])
-        context_md = truncate_markdown(paper.markdown, self.max_input_chars)
+        context_md, source_desc = self._followup_context(paper, text)
         messages = [
             {"role": "system", "content": _FOLLOWUP_SYSTEM},
             {"role": "user", "content": (
-                f"论文《{paper.title}》全文（markdown，可能经截断）：\n\n{context_md}"
-                f"\n\n---\n用户追问：{text}"
+                f"论文《{paper.title}》{source_desc}（markdown）：\n\n{context_md}"
+                f"\n\n{CACHE_BREAK}\n\n---\n用户追问：{text}"
             )},
         ]
         try:
-            return self.kimi.chat(messages, heavy=True)
+            budget = paper_budget_profile(len(paper.markdown or ""))
+            return _chat_with_budget(
+                self.kimi,
+                messages,
+                heavy=True,
+                reasoning_effort="high",
+                max_tokens=budget.followup_output_tokens,
+            )
         except KimiError as exc:
             return f"调用大模型出错了：{exc}"
 
@@ -802,6 +1346,7 @@ class PaperReadingService:
             alert_fn=self._stuck_alert_fn(context.chat_id, label),
             calls_fn=lambda: get_llm_stats()["calls"] - stats0["calls"],
             cached_fn=lambda: get_llm_stats()["cached_tokens"] - stats0["cached_tokens"],
+            state_path=_card_state_path(dedup_key) if dedup_key else None,
         ).start()
         context.status = status  # 按消息绑定：两篇精读并发，阶段行各进各的状态条
         thread = threading.Thread(
@@ -861,32 +1406,65 @@ class PaperReadingService:
         不触碰 status 的定格/冻结语义；首次进入退避时另经外发箱发一条必达文本
         （断网期状态条/卡片可能都到不了用户）。重跑幂等性见 TRANSIENT_RETRY_BACKOFFS 注释。
         """
+        # 通道对齐：进度分发读 context.status，而 status 也可能只经参数传入
+        # （脚本入口就是这条路径）——不设上则卡片永远停在第一帧且无任何报错。
+        # 在管线入口统一补齐，封死「只传参没挂上下文」这一类静默僵尸卡。
+        if getattr(context, "status", None) is None and status is not None:
+            context.status = status
         retries = 0
+        long_wait_start: float | None = None  # 进入长候模式的时间点（None=还在 ladder 内）
         while True:
             try:
                 return job(context=context, **kwargs)
             except Exception as exc:
-                if not _is_transient_error(exc) or retries >= len(TRANSIENT_RETRY_BACKOFFS):
+                if not _is_transient_error(exc):
                     raise
-                delay = TRANSIENT_RETRY_BACKOFFS[retries]
-                retries += 1
-                if retries == 1:
-                    # 首次进入退避：网络可能正断着，错误卡未必发得出，
-                    # 必达文本经外发箱排队补发——用户不刷状态条也知道在自动重试
+                now = time.time()
+                if retries < len(TRANSIENT_RETRY_BACKOFFS):
+                    delay = TRANSIENT_RETRY_BACKOFFS[retries]
+                    retries += 1
+                    if retries == 1:
+                        # 首次进入退避：网络可能正断着，错误卡未必发得出，
+                        # 必达文本经外发箱排队补发——用户不刷状态条也知道在自动重试
+                        self._enqueue_notify(
+                            context.chat_id,
+                            f"⚠️ 精读{label}遇到网络问题，正在自动重试，完成后告诉你",
+                        )
+                    logger.warning(
+                        "精读瞬时网络故障（%s: %s），%d 秒后自动重试（第 %d/%d 次）：%s",
+                        type(exc).__name__, exc, delay, retries,
+                        len(TRANSIENT_RETRY_BACKOFFS), label,
+                    )
+                    status.set_stage(
+                        f"🌐 网络中断，{delay // 60} 分钟后自动重试"
+                        f"（第 {retries}/{len(TRANSIENT_RETRY_BACKOFFS)} 次）"
+                    )
+                    time.sleep(delay)
+                    continue
+                # ladder 耗尽 → 长候模式：每 10 分钟重试，次数封顶才放弃
+                if long_wait_start is None:
+                    long_wait_start = now
                     self._enqueue_notify(
                         context.chat_id,
-                        f"⚠️ 精读{label}遇到网络问题，正在自动重试，完成后告诉你",
+                        f"⚠️ 精读{label}网络仍未恢复，转入长候模式"
+                        f"（每 {TRANSIENT_LONG_WAIT_INTERVAL // 60} 分钟自动重试，"
+                        f"最多再等 {TRANSIENT_LONG_WAIT_MAX_ATTEMPTS} 次）",
                     )
+                long_wait_attempts = retries - len(TRANSIENT_RETRY_BACKOFFS) + 1
+                if long_wait_attempts > TRANSIENT_LONG_WAIT_MAX_ATTEMPTS:
+                    raise  # 长候次数耗尽：放弃，走失败路径
+                retries += 1
+                waited_min = int((now - long_wait_start) // 60)
                 logger.warning(
-                    "精读瞬时网络故障（%s: %s），%d 秒后自动重试（第 %d/%d 次）：%s",
-                    type(exc).__name__, exc, delay, retries,
-                    len(TRANSIENT_RETRY_BACKOFFS), label,
+                    "精读长候模式：%s 仍不可达，%d 秒后再试（第 %d/%d 次）：%s",
+                    type(exc).__name__, TRANSIENT_LONG_WAIT_INTERVAL,
+                    long_wait_attempts, TRANSIENT_LONG_WAIT_MAX_ATTEMPTS, label,
                 )
                 status.set_stage(
-                    f"🌐 网络中断，{delay // 60} 分钟后自动重试"
-                    f"（第 {retries}/{len(TRANSIENT_RETRY_BACKOFFS)} 次）"
+                    f"🌐 等待网络恢复（长候重试第 {long_wait_attempts}/"
+                    f"{TRANSIENT_LONG_WAIT_MAX_ATTEMPTS} 次）"
                 )
-                time.sleep(delay)
+                time.sleep(TRANSIENT_LONG_WAIT_INTERVAL)
 
     def _run_guarded(self, context: MessageContext, label: str, job, kwargs: dict,
                      status: "StatusMessenger | TaskCard", dedup_key: str = "") -> None:
@@ -917,23 +1495,22 @@ class PaperReadingService:
             if release_status == "verified_final"
             else f"精读完成，发布状态：{_release_label(metadata)}"
             if release_status else
-            "精读完成，文档与详情见下方结果卡"
+            "精读完成，结果见本卡"
         )
         # 任务执行已完成不等于质量审查通过；状态条明确展示 V9 release_status，
         # 但任务登记仍记 done，避免已交付草稿被重启恢复反复生成。
-        status.stop(ok=True, note=status_note)
         arxiv_id = kwargs.get("arxiv_id", "")
-        self.sender.send_card(
-            context.chat_id,
-            build_result_card(metadata, doc_url, arxiv_id, archived,
-                              timing_text=str(metadata.get("_timing", ""))),
-        )
+        paper_ref = str(metadata.get("_paper_ref") or arxiv_id)
+        result_md = _result_markdown(
+            metadata, doc_url, arxiv_id, archived,
+            timing_text=str(metadata.get("_timing", "")))
+        status.stop(ok=True, note=status_note, result_md=result_md)
         logger.info("精读任务完成：%s → %s", label, doc_url)
         # 完成钩子：切换到绑定会话等（失败不影响主流程）
         if self.on_done is not None:
             try:
                 title = metadata.get("title_zh") or metadata.get("title_en") or label
-                note = self.on_done(context, title, arxiv_id)
+                note = self.on_done(context, title, paper_ref)
                 if note:
                     self.sender.send_text(context.chat_id, note)
             except Exception:
@@ -1002,23 +1579,109 @@ class PaperReadingService:
         logger.info("中断精读任务已自动恢复：%s（kind=%s）", task.label, task.kind)
         return True
 
-    def answer_in_session(self, session: Any, text: str) -> str:
+    def _followup_context(self, paper: Any, question: str) -> tuple[str, str]:
+        """追问的论文内容区（缓存前缀，必须稳定）：短文全文、长文按问题检索章节。"""
+        body = paper.markdown or ""
+        budget = paper_budget_profile(len(body))
+        if paper_size_tier(len(body)) == "short":
+            return body, "全文"
+        packet = _retrieve_sections_info(
+            body,
+            question,
+            budget=budget.source_budget("followup"),
+        )
+        if packet.text is None:
+            navigation = _retrieval_navigation(
+                body,
+                budget=min(40_000, budget.followup_retrieval_chars),
+            )
+            return navigation, f"检索未命中时的摘要与章节导航（{packet.reason}）"
+        context_md = packet.text
+        if packet.omitted_titles:
+            context_md += (
+                "\n\n（未展开的章节：" + "、".join(packet.omitted_titles[:20])
+                + "——需要时可点名追问）"
+            )
+        locations = "、".join(packet.selected_locations[:6])
+        return context_md, f"按问题检索的相关块（位置：{locations}）"
+
+    @staticmethod
+    def _followup_retrieval_query(text: str, history_msgs: Any) -> str:
+        """当前追问指代过强时，用上一条真实用户问题补全检索式。"""
+        cleaned = _association_query(text)
+        underspecified = (
+            len(cleaned) < 6
+            or bool(re.search(r"(?:它|这个|那个|第二个|前者|后者|再详细|继续|上面)", text))
+        )
+        if not underspecified:
+            return text
+        previous_users: list[str] = []
+        for msg in history_msgs or []:
+            if getattr(msg, "role", "") != "user":
+                continue
+            content = str(getattr(msg, "content", "") or "").strip()
+            if content and content != text:
+                previous_users.append(content)
+        if not previous_users:
+            return text
+        return previous_users[-1] + "\n" + text
+
+    def _followup_history(self, history_msgs: Any) -> str:
+        """最近 N 轮问答（放在缓存哨兵之后，不影响前缀缓存命中）。
+        消息由 SessionService 侧传入（PaperStore 不持有会话存储）。"""
+        pairs: list[tuple[str, str]] = []
+        pending_q = ""
+        for msg in history_msgs or []:
+            role = getattr(msg, "role", "")
+            content = str(getattr(msg, "content", "") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                pending_q = content
+            elif role == "assistant" and pending_q:
+                pairs.append((pending_q, content))
+                pending_q = ""
+        pairs = pairs[-FOLLOWUP_HISTORY_ROUNDS:]
+        if not pairs:
+            return ""
+        lines = ["## 对话记录（最近的问答，供承接上文）"]
+        used = 0
+        for q, a in pairs:
+            entry = f"问：{q}\n答：{_trunc(a, 300)}"
+            if used + len(entry) > FOLLOWUP_HISTORY_CHARS:
+                break
+            lines.append(entry)
+            used += len(entry)
+        return "\n\n".join(lines) + "\n\n" if len(lines) > 1 else ""
+
+    def answer_in_session(self, session: Any, text: str, history_msgs: Any = None) -> str:
         """绑定精读会话内的问答：带该会话绑定论文的全文上下文。"""
-        paper = self.store.get_paper_by_arxiv(session.bind_ref) if session.bind_ref else None
+        paper = self.store.get_paper_by_arxiv(
+            session.bind_ref, chat_id=session.chat_id
+        ) if session.bind_ref else None
         if paper is None:
             paper = self.store.latest_paper(session.chat_id)
         if paper is None:
             return "本会话绑定的论文找不到了（可能已被清理），发「切换 N」换个会话聊吧。"
-        context_md = truncate_markdown(paper.markdown, self.max_input_chars)
+        retrieval_query = self._followup_retrieval_query(text, history_msgs)
+        context_md, source_desc = self._followup_context(paper, retrieval_query)
+        history = self._followup_history(history_msgs)
         messages = [
             {"role": "system", "content": _FOLLOWUP_SYSTEM},
             {"role": "user", "content": (
-                f"论文《{paper.title}》全文（markdown，可能经截断）：\n\n{context_md}"
-                f"\n\n---\n用户提问：{text}"
+                f"论文《{paper.title}》{source_desc}（markdown）：\n\n{context_md}"
+                f"\n\n{CACHE_BREAK}\n\n{history}---\n用户提问：{text}"
             )},
         ]
         try:
-            return self.kimi.chat(messages, heavy=True)
+            budget = paper_budget_profile(len(paper.markdown or ""))
+            return _chat_with_budget(
+                self.kimi,
+                messages,
+                heavy=True,
+                reasoning_effort="high",
+                max_tokens=budget.followup_output_tokens,
+            )
         except KimiError as exc:
             return f"调用大模型出错了：{exc}"
 
@@ -1193,6 +1856,7 @@ class PaperReadingService:
 
         metadata = reading.metadata
         metadata["_version"] = version
+        metadata["_paper_ref"] = arxiv_id or key
         title = metadata.get("title_zh") or metadata.get("title_en") or key
         classifier = self.kimi
         classifier_factory = getattr(self.reading_engine, "classification_client", None)
@@ -1253,6 +1917,9 @@ class PaperReadingService:
             self.store.save_paper(
                 context.chat_id, arxiv_id or key, title,
                 paper_md, doc_url=doc_url, pdf_path=str(pdf_path),
+                association_text=_paper_association_text(
+                    title, str(metadata.get("tldr", "")), paper_md
+                ),
             )
         except Exception as exc:
             logger.exception("sqlite 落库失败（不影响已交付正文）：%s", exc)

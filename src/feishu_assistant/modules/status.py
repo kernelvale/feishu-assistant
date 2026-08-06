@@ -37,10 +37,12 @@ stop 先停线程再写定格帧，定格帧必是最后一帧（_final_written 
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from ..activity import REGISTRY, ActivityRegistry
@@ -144,9 +146,10 @@ class StatusMessenger:
         self._thread.start()
         return self
 
-    def stop(self, ok: bool, note: str = "") -> None:
+    def stop(self, ok: bool, note: str = "", result_md: str = "") -> None:
         """定格最终帧并停线程。ok=True ✅ / False ❌。
         先停刷新线程再写定格帧（帧写锁挡住超时漏网的迟到帧），定格帧必是最后一帧。
+        result_md 非空时附加在定格帧之后（TaskCard 走元素追加，这里并入文本帧）。
         编辑次数已耗尽时最终帧可能写不进去（结果卡兜底，信息不丢）。"""
         self._stop.set()
         if self._thread is not None:
@@ -155,6 +158,8 @@ class StatusMessenger:
         tail = note or ("完成" if ok else "失败")
         final = (f"{mark} {_trunc(self.title, _STAGE_BUDGET)} · "
                  f"全程 {_fmt_duration(time.time() - self._t0)} · {tail}")
+        if result_md:
+            final += "\n" + result_md
         with self._frame_lock:
             self._final_written = True
             if self._frozen:  # 窗口已关：尽力写最后一帧（写不进也不影响任务）
@@ -404,7 +409,7 @@ _PAPER_PROGRESS_RULES: tuple[tuple[str, int, str], ...] = (
 _STAGE_MARKS = {"done": "✅", "current": "🔄", "pending": "⏳"}
 
 # 进行中痕迹：阶段打勾后 detail 里出现这些词属于自相矛盾（「✅ …生成中……」），一律清除
-_INPROGRESS_MARKERS = ("生成中", "进行中", "编译中", "索引中", "讲解中", "返工")
+_INPROGRESS_MARKERS = ("生成中", "进行中", "编译中", "索引中", "讲解中", "返工", "正在")
 _INCOMPLETE_FRACTION_RE = re.compile(r"\d+/\d+")
 
 
@@ -457,6 +462,7 @@ class TaskCard(StatusMessenger):
         interval: float = 3.0,
         calls_fn: Any = None,
         cached_fn: Any = None,
+        state_path: Any = None,
     ) -> None:
         super().__init__(sender, chat_id, title,
                          interval=interval, registry=registry, alert_fn=alert_fn)
@@ -467,12 +473,100 @@ class TaskCard(StatusMessenger):
         # 可选：返回累计缓存 token 数的 callable（统计行追加「· 缓存 X.Xk」，0 省略）
         self.cached_fn = cached_fn
         self._events: list[dict[str, Any]] = []  # 最近动态：{text, count, ts}
+        # 原卡接管：状态文件路径（None=不持久化，每次新卡）
+        self._state_path = Path(state_path) if state_path else None
+        self._last_todo = ""
+        self._last_events = ""
+        self._last_footer = ""
+
+    # ---- 原卡接管：进程重启/脚本重跑后续用同一张卡，不再制造僵尸卡 ----
+
+    def _persist_state(self) -> None:
+        """把 card_id、阶段状态、时间基准、已用流式序号落盘（供接管恢复）。"""
+        if not (self._state_path and self._msg_id):
+            return
+        seq = 0
+        get_seq = getattr(self.sender, "status_card_current_seq", None)
+        if callable(get_seq):
+            try:
+                seq = int(get_seq(self._msg_id))
+            except Exception:
+                seq = 0
+        payload = {
+            "card_id": self._msg_id,
+            "title": self.title,
+            "stages": self._stages,
+            "events": self._events[-3:],
+            "started_at": self._t0,
+            "seq": seq,
+        }
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            logger.warning("任务卡状态持久化失败（不影响任务）")
+
+    def _try_takeover(self) -> bool:
+        """尝试接管既有卡片：重激活流式窗口并把当前状态刷进旧卡。成功 True。"""
+        if self._state_path is None or not self._state_path.exists():
+            return False
+        try:
+            saved = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        card_id = str(saved.get("card_id") or "").strip()
+        if not card_id:
+            return False
+        reactivate = getattr(self.sender, "status_card_reactivate", None)
+        if not callable(reactivate):
+            return False
+        try:
+            if not reactivate(card_id):
+                return False
+        except Exception:
+            return False
+        # 接管成功：恢复阶段状态/事件/时间基准/流式序号
+        saved_stages = saved.get("stages") or []
+        if len(saved_stages) == len(self._stages):
+            self._stages = [dict(s) for s in saved_stages]
+        self._events = [dict(e) for e in (saved.get("events") or [])]
+        try:
+            self._t0 = float(saved.get("started_at") or self._t0)
+        except (TypeError, ValueError):
+            pass
+        self._msg_id = card_id
+        seed_seq = getattr(self.sender, "status_card_seed_seq", None)
+        if callable(seed_seq):
+            try:
+                seed_seq(card_id, int(saved.get("seq") or 0))
+            except Exception:
+                pass
+        self._use_card = True
+        self._window_start = time.time()  # 重激活即新窗口起点
+        logger.info("任务卡接管原卡继续更新：%s", card_id)
+        return True
 
     # ---- 生命周期 ----
 
     def start(self) -> "TaskCard":
-        """仅走 Card Kit 流式卡（整卡布局：header + TODO 元素 + 页脚元素）；
+        """仅走 Card Kit 流式卡（整卡布局：header + TODO + 最近动态 + 页脚）。
+        有状态文件时优先接管原卡（重激活续写，不制造僵尸卡）；
         首发失败/无卡通道静默降级（任务继续，仅无进度卡）。"""
+        if self._try_takeover():
+            # 接管成功：把当前状态刷进旧卡，然后进入正常刷新循环
+            activities = self.registry.snapshot()
+            with self._lock:
+                stages = [(s["name"], s["state"], s["detail"]) for s in self._stages]
+                events = [dict(e) for e in self._events]
+            self._patch_elements(
+                self._todo_content(stages), self._events_content(events),
+                self._footer_content(activities))
+            self._last_sig = self._signature(activities)
+            self._thread = threading.Thread(
+                target=self._loop, name=f"taskcard-{int(self._t0)}", daemon=True)
+            self._thread.start()
+            return self
         create = getattr(self.sender, "rich_card_create", None)
         if create is None:
             logger.warning("sender 无富文本卡通道，任务进度卡静默降级：%s", self.title)
@@ -493,15 +587,18 @@ class TaskCard(StatusMessenger):
         self._last_todo, self._last_events, self._last_footer = todo, events, footer
         self._last_sig = self._signature(self.registry.snapshot())
         self._window_start = time.time()  # 卡创建即一次激活：窗口计时从这里起算
+        self._persist_state()
         self._thread = threading.Thread(
             target=self._loop, name=f"taskcard-{int(self._t0)}", daemon=True)
         self._thread.start()
         return self
 
-    def finish(self, ok: bool, note: str = "") -> None:
+    def finish(self, ok: bool, note: str = "", result_md: str = "") -> None:
         """定格最终帧并停线程：TODO 终态 + ✅/❌ 全程时长 + note。
         成功时剩余阶段全部打勾；失败保留终态（死在哪个阶段一眼可见）。
         事件区原样保留（终态可见最后三条动态）。
+        result_md 非空时把结果区（文档链接/计时/归档等）追加进同一卡片，
+        不再单独发结果卡；追加失败则并入页脚，信息不丢。
         先停线程再写定格帧（帧写锁挡住迟到帧），定格帧必是最后一帧。"""
         self._stop.set()
         if self._thread is not None:
@@ -514,7 +611,41 @@ class TaskCard(StatusMessenger):
         with self._frame_lock:
             self._final_written = True
             self._patch_elements(todo, events, footer, best_effort=self._frozen)
+            if result_md and self._msg_id:
+                appended = False
+                append = getattr(self.sender, "status_card_append", None)
+                if append is not None and not self._frozen:
+                    try:
+                        code = append(self._msg_id, result_md)
+                    except Exception:
+                        logger.exception("结果区追加失败（并入页脚）")
+                        code = "exception"
+                    if not code:
+                        appended = True
+                    else:  # 疑似窗口关闭：重激活后再试一次
+                        self._reactivate_card()
+                        try:
+                            appended = not append(self._msg_id, result_md)
+                        except Exception:
+                            appended = False
+                if not appended:  # 追加失败兜底：结果并入页脚，信息不丢
+                    fallback = footer + "\n" + result_md
+                    try:
+                        self.sender.status_card_update(
+                            f"{self._msg_id}|{self._FOOTER_ELEMENT}", fallback)
+                    except Exception:
+                        logger.exception("结果并入页脚失败（结果卡兜底）")
         self._close_card_seq()
+        self._discard_state()
+
+    def _discard_state(self) -> None:
+        """任务定格后删除状态文件：下次同论文启动新卡，而非接管一张已完成卡。"""
+        if self._state_path is None:
+            return
+        try:
+            self._state_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # ---- 帧写（元素级：TODO/事件区/页脚分开 PATCH）----
 
@@ -540,6 +671,7 @@ class TaskCard(StatusMessenger):
                 return
             if not code:
                 setattr(self, attr, content)
+                self._persist_state()  # 状态有推进即落盘：接管方能恢复到最新一帧
                 continue
             if code == "230072":
                 self._frozen = True
@@ -569,9 +701,10 @@ class TaskCard(StatusMessenger):
         self._patch_elements(self._todo_content(stages), self._events_content(events),
                              self._footer_content(activities))
 
-    def stop(self, ok: bool, note: str = "") -> None:
-        """与 StatusMessenger 同协议的定格入口（paper._run_guarded 调 stop）。"""
-        self.finish(ok, note)
+    def stop(self, ok: bool, note: str = "", result_md: str = "") -> None:
+        """与 StatusMessenger 同协议的定格入口（paper._run_guarded 调 stop）。
+        result_md 非空时结果区并入本卡定格帧，不再单独发结果卡。"""
+        self.finish(ok, note, result_md=result_md)
 
     # ---- 阶段状态机 ----
 

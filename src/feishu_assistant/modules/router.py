@@ -4,10 +4,12 @@
 1. 命令注册表（整句精确匹配，忽略首尾空白和结尾标点；带参命令按正则）
 2. 未知 / 开头 → 提示
 3. paper_fn：arXiv 链接 / 精读触发 → 精读管线（异步 ack）
-4. followup_fn：论文追问（近 N 小时 + 追问关键词）
+4. 显式归档意图：在模型问答前走 inbox_fn，只有真实写库成功才确认
 5. career_fn：P3 求职（career 绑定会话的模拟面试消息、JD 粘贴识别）
 6. inbox_fn：P4 万能收件箱（链接 / 「记一下/提醒我/收藏/灵感」开头 → 三库归档）
-7. chat_fn：自由对话（会话系统，含记忆）
+7. 论文绑定会话：直接交给会话服务，绑定论文优先于任何语义匹配
+8. followup_fn：无绑定会话的论文追问（近 N 小时 + 追问关键词）
+9. chat_fn：自由对话（会话系统，含记忆）
 
 口令匹配刻意保守（整句精确匹配），避免误伤正常聊天（如「我今天想吃面」不会命中「今日」）。
 /help 由注册表自动生成。各 hook 以 callable/对象注入，测试可传 fake。
@@ -36,6 +38,7 @@ UNKNOWN_COMMAND_HINT = "未知命令「{cmd}」。发 /help 或点菜单「帮�
 # chat_fn 同样收 (text, context)（会话系统需要上下文），返回 str
 Hook = Callable[[str, Any], "str | None"]
 ChatHook = Callable[[str, Any], str]
+IntentPredicate = Callable[[str], bool]
 
 _TRAILING_PUNCT = "。！？!?.，,、~～… "
 
@@ -84,6 +87,13 @@ COMMANDS: list[Command] = [
     Command(("删除",), "_cmd_delete", "删除 N：删除第 N 个会话（需二次确认）",
             arg_pattern=r"删除\s*(\d+)", needs_context=True),
     Command(("确认删除",), "_cmd_delete_confirm", "确认删除：执行待确认的会话删除",
+            needs_context=True),
+    # ---- 长期记忆（「记住」≠ inbox 的「记一下」，后者写备忘库不动）----
+    Command(("记住",), "_cmd_remember", "记住 xxx：写入长期记忆（之后对话自动带上）",
+            arg_pattern=r"记住(?:\s+|[：:])(.+)", needs_context=True),
+    Command(("忘掉",), "_cmd_forget", "忘掉 xxx：按关键词模糊删除长期记忆",
+            arg_pattern=r"忘掉(?:\s+|[：:])(.+)", needs_context=True),
+    Command(("我的记忆",), "_cmd_memories", "我的记忆：列出全部长期记忆",
             needs_context=True),
     # ---- P4 自动化推送 ----
     Command(("arXiv日报", "arxiv日报"), "_cmd_arxiv_daily",
@@ -181,6 +191,7 @@ class Router:
         digest_svc: Any = None,
         career_fn: Hook | None = None,
         inbox_fn: Hook | None = None,
+        inbox_priority_fn: IntentPredicate | None = None,
         paper_svc: Any = None,
         model_svc: Any = None,
         panel_tables: dict[str, str] | None = None,
@@ -196,6 +207,7 @@ class Router:
         self.model_svc = model_svc
         self.career_fn = career_fn
         self.inbox_fn = inbox_fn
+        self.inbox_priority_fn = inbox_priority_fn
         self.panel_tables = panel_tables or {}
 
     # ------------------------------------------------------------------
@@ -237,11 +249,30 @@ class Router:
                 logger.info("路由命中：论文精读")
                 return reply
 
-        if self.followup_fn is not None:
-            reply = self.followup_fn(text, context)
+        # 明确的「写进灵感库/存到收藏库」必须在所有模型问答路径之前执行；
+        # 确认文案只能来自 inbox_fn 的真实写库返回值。
+        inbox_prechecked = False
+        if self.inbox_fn is not None and self.inbox_priority_fn is not None \
+                and self.inbox_priority_fn(text):
+            inbox_prechecked = True
+            reply = self.inbox_fn(text, context)
             if reply is not None:
-                logger.info("路由命中：论文追问")
+                logger.info("路由命中：万能收件箱（显式归档意图）")
                 return reply
+
+        active_bind_type = self._active_bind_type(context)
+
+        # 论文绑定关系比 JD 猜测和全库向量都可靠。仍先放行普通 inbox 规则，保证
+        # 用户在论文会话里发「收藏：链接」或普通网页链接时能正常归档。
+        if active_bind_type == "paper" and self.chat_fn is not None:
+            if self.inbox_fn is not None and not inbox_prechecked:
+                inbox_prechecked = True
+                reply = self.inbox_fn(text, context)
+                if reply is not None:
+                    logger.info("路由命中：万能收件箱（论文绑定会话内）")
+                    return reply
+            logger.info("路由命中：论文绑定会话")
+            return self.chat_fn(text, context)
 
         if self.career_fn is not None:
             reply = self.career_fn(text, context)
@@ -249,16 +280,36 @@ class Router:
                 logger.info("路由命中：求职模块")
                 return reply
 
-        if self.inbox_fn is not None:
+        if self.inbox_fn is not None and not inbox_prechecked:
             reply = self.inbox_fn(text, context)
             if reply is not None:
                 logger.info("路由命中：万能收件箱")
+                return reply
+
+        if self.followup_fn is not None:
+            reply = self.followup_fn(text, context)
+            if reply is not None:
+                logger.info("路由命中：论文追问")
                 return reply
 
         if self.chat_fn is None:
             return "对话功能暂时不可用，请稍后再试。发 /help 查看可用命令。"
         logger.info("路由命中：自由对话")
         return self.chat_fn(text, context)
+
+    def _active_bind_type(self, context: Any) -> str:
+        """读取当前活跃会话绑定类型；存储异常时按无绑定降级。"""
+        chat_id = getattr(context, "chat_id", "") if context is not None else ""
+        store = getattr(self.session_svc, "store", None)
+        getter = getattr(store, "get_active_session", None)
+        if not chat_id or getter is None:
+            return ""
+        try:
+            session = getter(chat_id)
+        except Exception:
+            logger.exception("读取活跃会话失败（按无绑定继续）")
+            return ""
+        return str(getattr(session, "bind_type", "") or "") if session is not None else ""
 
     def _dispatch(self, cmd: Command, match: re.Match | None, context: Any) -> str:
         handler = getattr(self, cmd.handler)
@@ -486,3 +537,18 @@ class Router:
         if (err := self._session_required()) or context is None:
             return err or "会话命令需要消息上下文。"
         return self.session_svc.cmd_delete_confirm(context)
+
+    def _cmd_remember(self, arg: str, context: Any) -> str:
+        if (err := self._session_required()) or context is None:
+            return err or "记忆命令需要消息上下文。"
+        return self.session_svc.cmd_remember(arg, context)
+
+    def _cmd_forget(self, arg: str, context: Any) -> str:
+        if (err := self._session_required()) or context is None:
+            return err or "记忆命令需要消息上下文。"
+        return self.session_svc.cmd_forget(arg, context)
+
+    def _cmd_memories(self, context: Any) -> str:
+        if (err := self._session_required()) or context is None:
+            return err or "记忆命令需要消息上下文。"
+        return self.session_svc.cmd_memories(context)

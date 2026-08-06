@@ -3889,6 +3889,15 @@ class ReadingEngine:
                 paper_md, workspace=workspace, progress=progress,
             )
             planner_material = evidence.planner_material(paper_md)
+            degraded_chunks = dict(getattr(evidence, "degraded_chunks", {}) or {})
+            if degraded_chunks:
+                detail = "；".join(
+                    f"{chunk_id}: {reason[:100]}"
+                    for chunk_id, reason in list(degraded_chunks.items())[:6]
+                )
+                note = f"{len(degraded_chunks)} 个证据块使用原文导航卡：{detail}"
+                pre_plan_notes.append(note)
+                progress("⚠️ 部分证据块已单块降级，其余证据索引继续使用")
         except EvidenceError as exc:
             # 产出优先：证据索引失败 → 确定性重建分块（分块不依赖模型，失败发生在
             # 建卡阶段），全部块降级为原文导航卡继续

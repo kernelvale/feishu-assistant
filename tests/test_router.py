@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 from feishu_assistant.modules.paper import MessageContext
 from feishu_assistant.modules.router import COMMANDS, HELP_TEXT, PANEL_URL, Router
@@ -261,6 +262,42 @@ def test_followup_hook_called_before_chat():
     router.followup_fn = lambda t, c: "追问回答" if "第三章" in t else None
     assert router.handle("第三章怎么算的") == "追问回答"
     assert router.handle("今天天气") == "对话回复"
+
+
+def test_explicit_archive_intent_runs_before_followup_and_career():
+    calls: list[str] = []
+    router = Router(
+        chat_fn=lambda t, c: calls.append("chat") or "对话",
+        paper_fn=lambda t, c: None,
+        followup_fn=lambda t, c: calls.append("followup") or "错误追问",
+        career_fn=lambda t, c: calls.append("career") or "错误求职",
+        inbox_fn=lambda t, c: calls.append("inbox") or "真实入库成功",
+        inbox_priority_fn=lambda t: "写进灵感库" in t,
+    )
+    reply = router.handle("这是我对概率续写的表面理解，写进灵感库", CTX)
+    assert reply == "真实入库成功"
+    assert calls == ["inbox"]
+
+
+def test_bound_paper_session_beats_generic_followup_matching():
+    calls: list[str] = []
+
+    class BoundSessionSvc(FakeSessionSvc):
+        def __init__(self):
+            super().__init__()
+            self.store = SimpleNamespace(
+                get_active_session=lambda chat_id: SimpleNamespace(bind_type="paper")
+            )
+
+    router = Router(
+        chat_fn=lambda t, c: calls.append("bound_chat") or "绑定论文回答",
+        paper_fn=lambda t, c: None,
+        followup_fn=lambda t, c: calls.append("followup") or "错误关联回答",
+        inbox_fn=lambda t, c: None,
+        session_svc=BoundSessionSvc(),
+    )
+    assert router.handle("方法为什么这样设计", CTX) == "绑定论文回答"
+    assert calls == ["bound_chat"]
 
 
 def test_empty_text_returns_empty():

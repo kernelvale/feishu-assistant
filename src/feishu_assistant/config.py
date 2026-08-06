@@ -112,7 +112,7 @@ class Settings:
     # 大模型调用参数
     kimi_timeout: int = 60
     kimi_max_retries: int = 2
-    max_input_chars: int = 60_000  # 追问上下文预算；V3 精读使用全文证据索引，不按此值截尾
+    max_input_chars: int = 60_000  # 历史配置保留（兼容旧配置文件）；追问上下文已按论文尺寸分路，见 paper.py FOLLOWUP_CONTEXT_CHARS
     # 会话系统上下文预算（session 段，键见 modules/session.py ContextBudget）
     session_budget: dict[str, int] = field(default_factory=dict)
     # 加载过程中收集的中文警告（key 缺失、旧变量兼容等）

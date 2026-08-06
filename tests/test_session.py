@@ -193,7 +193,8 @@ def test_assembler_recent_window_and_token_budget(tmp_path):
         store.add_message(session.id, "c1", "user", f"第{i}条" + "x" * 30)
     store.add_message(session.id, "c1", "user", "现在")  # 当前消息先落库（与 chat 流程一致）
     assembled = svc.assemble_context(session)
-    contents = [m["content"] for m in assembled.messages[1:-1]]
+    contents = [m["content"].replace("\n<!--CACHE_BREAK-->", "")
+                for m in assembled.messages[1:-1]]  # 缓存哨兵不计入内容断言
     assert "第5条" + "x" * 30 in contents
     assert "第0条" + "x" * 30 not in contents  # 旧消息被窗口/预算裁掉
     assert assembled.recent_count <= 4  # 最多 recent_rounds*2 条
@@ -289,7 +290,7 @@ def test_bind_paper_session(tmp_path):
 def test_bound_session_chat_uses_paper_qa(tmp_path):
     svc, kimi, store = make_service(tmp_path)
     qa_calls = []
-    svc.paper_qa_fn = lambda session, text: qa_calls.append(text) or "论文问答回复"
+    svc.paper_qa_fn = lambda session, text, **kw: qa_calls.append(text) or "论文问答回复"
     svc.bind_paper_session(CTX, "AutoHarness", "2603.03329")
     reply = svc.chat("第三章怎么算的", CTX)
     assert reply == "论文问答回复"
@@ -374,3 +375,23 @@ def test_delete_confirm_via_router_not_cancelled(tmp_path):
     reply = router.handle("确认删除", CTX)
     assert reply.startswith("🗑")
     assert all(s.title != "要删的" for s in svc.store.list_sessions("c1", include_archived=True))
+
+
+def test_assembler_places_cache_break_before_current_question(tmp_path):
+    """缓存断点钉住：哨兵落在当前问题之前的稳定前缀末尾（多轮增量缓存的关键）。"""
+    svc, _, store = make_service(tmp_path)
+    session = store.get_or_create_default_session("c1")
+    store.add_message(session.id, "c1", "user", "问题一")
+    store.add_message(session.id, "c1", "assistant", "回答一")
+    store.add_message(session.id, "c1", "user", "问题二")
+    assembled = svc.assemble_context(session)
+    msgs = assembled.messages
+    # 哨兵在「回答一」末尾（稳定前缀终点），当前问题「问题二」在哨兵之后不缓存
+    assert msgs[-2]["content"].endswith("<!--CACHE_BREAK-->")
+    assert msgs[-2]["role"] == "assistant"
+    assert "<!--CACHE_BREAK-->" not in msgs[-1]["content"]
+    # 首轮（无历史）：哨兵落 system（人设/记忆是稳定前缀）
+    s2 = store.create_session("c1", "新会话")
+    store.add_message(s2.id, "c1", "user", "你好")
+    assembled2 = svc.assemble_context(s2)
+    assert assembled2.messages[0]["content"].endswith("<!--CACHE_BREAK-->")

@@ -65,7 +65,8 @@ def test_placeholders_removed():
 
 
 # ---------------------------------------------------------------------------
-# 钩子链顺序：followup → career → inbox → chat
+# 钩子链顺序：career → inbox → followup → chat
+# 显式归档另有优先谓词，会在 career 之前直接走 inbox（见 test_router）。
 # ---------------------------------------------------------------------------
 
 def make_chain_router():
@@ -83,15 +84,15 @@ def make_chain_router():
 def test_hook_chain_career_before_inbox_before_chat():
     router, calls = make_chain_router()
     assert router.handle("career命中") == "CAREER"
-    assert calls == ["followup", "career"]  # career 接管后不触达 inbox/chat
+    assert calls == ["career"]  # career 接管后不触达 inbox/followup/chat
 
     calls.clear()
     assert router.handle("inbox命中") == "INBOX"
-    assert calls == ["followup", "career", "inbox"]
+    assert calls == ["career", "inbox"]
 
     calls.clear()
     assert router.handle("普通闲聊") == "CHAT"
-    assert calls == ["followup", "career", "inbox", "chat"]  # 顺序全链
+    assert calls == ["career", "inbox", "followup", "chat"]  # 顺序全链
 
 
 # ---------------------------------------------------------------------------

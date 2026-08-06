@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 
 from feishu_assistant.config import PROJECT_ROOT
+from feishu_assistant.kimi import FrozenKimiClient, KimiError
 from feishu_assistant.modules.reading_evidence import (
+    SHORT_PAPER_CHARS,
     SOURCE_CHUNK_CHARS,
     _chunk_base_title,
     _json_object,
@@ -13,7 +17,9 @@ from feishu_assistant.modules.reading_evidence import (
     EvidenceCard,
     EvidenceError,
     EvidenceIndexer,
+    paper_budget_profile,
     SourceChunk,
+    paper_size_tier,
     split_source,
 )
 from feishu_assistant.modules.reading_workflow import ReadingWorkspace
@@ -112,7 +118,7 @@ def test_code_fence_headings_do_not_split_source():
 
 
 def test_long_evidence_index_is_checkpointed_and_reused(tmp_path):
-    source = "# 综述\n\n" + "研究内容。" * 25_000 + "\n\n## 结论\n\n尾部结论"
+    source = "# 综述\n\n" + "研究内容。" * 45_000 + "\n\n## 结论\n\n尾部结论"
     workspace = ReadingWorkspace(tmp_path)
     first_client = EvidenceKimi()
     bundle, calls = EvidenceIndexer(first_client, PROJECT_ROOT / "prompts").build(
@@ -215,8 +221,8 @@ def test_source_packet_sibling_match_tolerates_pack_suffix():
     assert _chunk_base_title("普通章节") == "普通章节"
 
 
-def test_planner_material_accepts_large_index_within_cap():
-    """45 图 111 页级综述（~85k 索引）在放宽后的上限内放行；超 160k 仍拒绝。"""
+def test_planner_material_uses_layered_merge_for_oversized_index():
+    """超出 160k 的证据索引分层归并，不丢掉尾部 chunk。"""
     fat = "x" * 4_000
     cards = [EvidenceCard(chunk_id=f"chunk-{i:04d}", section=f"s{i}", claims=[fat])
              for i in range(1, 22)]  # 21 张 × 4k ≈ 85k
@@ -226,8 +232,11 @@ def test_planner_material_accepts_large_index_within_cap():
     too_many = [EvidenceCard(chunk_id=f"chunk-{i:04d}", section=f"s{i}", claims=[fat])
                 for i in range(1, 45)]  # 44 张 ≈ 180k
     bundle2 = EvidenceBundle(chunks=[], cards=too_many, long_mode=True)
-    with pytest.raises(EvidenceError, match="需要增加分层归并"):
-        bundle2.planner_material("")
+    material = bundle2.planner_material("")
+    assert len(material) <= 160_000
+    assert "分层归并" in material
+    for index in range(1, 45):
+        assert f"chunk-{index:04d}" in material
 
 
 def test_json_object_extracts_prose_wrapped_json():
@@ -240,7 +249,7 @@ def test_json_object_extracts_prose_wrapped_json():
 
 def test_card_build_retries_once_on_invalid_json(tmp_path):
     """证据卡首次返回非法 JSON 时带修正重试一次；重试成功正常建卡。"""
-    source = "# 综述\n\n" + "研究内容。" * 25_000 + "\n\n## 结论\n\n尾部结论"
+    source = "# 综述\n\n" + "研究内容。" * 45_000 + "\n\n## 结论\n\n尾部结论"
     workspace = ReadingWorkspace(tmp_path)
 
     class FlakyKimi(EvidenceKimi):
@@ -259,7 +268,7 @@ def test_card_build_retries_once_on_invalid_json(tmp_path):
 
 def test_card_build_falls_back_to_source_navigation_after_two_non_json_outputs(tmp_path):
     """API 成功但连续返回普通文本时，不应把格式偏差升级成整篇论文失败。"""
-    source = "# 综述\n\n" + "这是可核对的原文证据，解释了研究问题与方法。" * 8_000
+    source = "# 综述\n\n" + "这是可核对的原文证据，解释了研究问题与方法。" * 10_000
     workspace = ReadingWorkspace(tmp_path)
 
     class PlainTextKimi:
@@ -279,3 +288,262 @@ def test_card_build_falls_back_to_source_navigation_after_two_non_json_outputs(t
     assert calls == client.calls == 2 * len(bundle.chunks)
     assert all(card.orientation.startswith("原文导航摘录：") for card in bundle.cards)
     assert all(not card.claims for card in bundle.cards)  # 兜底不猜测论文结论
+
+
+def test_planner_material_second_layer_keeps_every_chunk_reference():
+    """卡片级压缩仍过长时进入分组层，所有 source ref 继续可见。"""
+    fat = "论据" * 300
+    cards = [
+        EvidenceCard(
+            chunk_id=f"chunk-{index:04d}",
+            section=f"章节 {index}",
+            orientation=f"方向 {index} " + fat,
+            claims=[fat, fat, fat],
+            mechanisms=[fat, fat, fat],
+            evidence=[fat, fat, fat],
+            limitations=[fat, fat, fat],
+        )
+        for index in range(1, 501)
+    ]
+    material = EvidenceBundle(chunks=[], cards=cards, long_mode=True).planner_material("")
+
+    assert len(material) <= 160_000
+    assert "evidence-group-" in material
+    for index in range(1, 501):
+        assert f"chunk-{index:04d}" in material
+
+
+def test_single_reasoning_exhausted_chunk_degrades_only_that_chunk(tmp_path):
+    """一个 chunk 双败只生成该块导航卡，其余真实证据卡和检查点保留。"""
+    source = (
+        "# 第一章\n\n" + "甲段内容。" * 15_000
+        + "\n\n## 第二章\n\n" + "乙段内容。" * 15_000
+        + "\n\n## 第三章\n\n" + "丙段内容。" * 15_000
+    )
+
+    class OneChunkFails:
+        def __init__(self) -> None:
+            self.calls: dict[str, int] = {}
+
+        def chat(self, messages, **kwargs):
+            prompt = str(messages[-1]["content"])
+            chunk_id = prompt.split("## 原文块 ", 1)[1].split()[0].strip()
+            self.calls[chunk_id] = self.calls.get(chunk_id, 0) + 1
+            if chunk_id == "chunk-0002":
+                raise KimiError("reasoning-exhaustion: 正文为空")
+            return json.dumps({
+                "chunk_id": chunk_id,
+                "orientation": f"{chunk_id} 的真实证据卡",
+                "definitions": [],
+                "claims": ["可核对主张"],
+                "mechanisms": [],
+                "evidence": [],
+                "limitations": [],
+                "open_questions": [],
+                "relations": [],
+                "figures": [],
+                "formulas": [],
+            }, ensure_ascii=False)
+
+    client = OneChunkFails()
+    workspace = ReadingWorkspace(tmp_path)
+    bundle, calls = EvidenceIndexer(client, PROJECT_ROOT / "prompts").build(
+        source, workspace=workspace,
+    )
+
+    assert calls == sum(client.calls.values())
+    assert client.calls["chunk-0002"] == 2
+    assert list(bundle.degraded_chunks) == ["chunk-0002"]
+    assert bundle.cards[1].orientation.startswith("原文导航摘录：")
+    assert all(
+        card.orientation.endswith("的真实证据卡")
+        for index, card in enumerate(bundle.cards)
+        if index != 1
+    )
+    assert workspace.get_json("evidence-chunk-0002")["_degraded_reason"]
+    assert bundle.index_metrics["degraded_chunks"] == 1
+
+
+def test_real_client_path_runs_evidence_calls_concurrently():
+    """线程池本身能达到多路 inflight；若生产日志仍串行，瓶颈位于网关侧。"""
+    source = "\n\n".join(
+        f"## 章节 {index}\n" + (f"内容 {index}。" * 12_000)
+        for index in range(1, 5)
+    )
+
+    class BlockingRecorder:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def chat(self, messages, **kwargs):
+            prompt = str(messages[-1]["content"])
+            chunk_id = prompt.split("## 原文块 ", 1)[1].split()[0].strip()
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.04)
+                return json.dumps({
+                    "chunk_id": chunk_id,
+                    "orientation": f"{chunk_id} 索引",
+                    "definitions": [], "claims": ["主张"], "mechanisms": [],
+                    "evidence": [], "limitations": [], "open_questions": [],
+                    "relations": [], "figures": [], "formulas": [],
+                }, ensure_ascii=False)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    # V9 生产路径传入的是 FrozenKimiClient；旧实现只识别 KimiClient，
+    # 导致 workers 永远为 1。这里钉住真实包装类型也必须进入并发路径。
+    recorder = BlockingRecorder()
+    client = object.__new__(FrozenKimiClient)
+    client.chat = recorder.chat
+    bundle, _ = EvidenceIndexer(client, PROJECT_ROOT / "prompts").build(source)
+
+    assert bundle.index_metrics["workers"] > 1
+    assert bundle.index_metrics["max_inflight_calls"] > 1
+    assert recorder.max_active > 1
+
+
+# ---- 预算按论文尺寸分路：统一分档 + 长文分层来源包 ----
+
+def test_paper_size_tier_boundaries():
+    """统一分档阈值 200k（估算宁大勿小，用户裁定）：≤ 阈值全文直通，超出走长文。"""
+    assert SHORT_PAPER_CHARS == 200_000
+    assert paper_size_tier(199_999) == "short"
+    assert paper_size_tier(200_000) == "short"
+    assert paper_size_tier(200_001) == "long"
+    assert paper_size_tier(0) == "short"
+
+
+def test_budget_profile_scales_input_output_and_draft_floor_with_paper_size():
+    compact = paper_budget_profile(10_000)
+    standard = paper_budget_profile(150_000)
+    long = paper_budget_profile(417_000)
+    extra = paper_budget_profile(700_000)
+
+    assert [item.tier for item in (compact, standard, long, extra)] == [
+        "compact", "standard", "long", "extra_long",
+    ]
+    assert compact.author_packet_chars < standard.author_packet_chars < long.author_packet_chars
+    assert compact.audit_output_tokens < standard.audit_output_tokens < long.audit_output_tokens
+    assert long.recommended_draft_chars >= 50_000
+    assert long.minimum_draft_chars >= 32_000
+    assert extra.author_parts == 4
+
+
+def test_evidence_retry_uses_low_reasoning_only_after_high_quality_first_attempt():
+    source = "# 综述\n\n" + "研究内容。" * 45_000
+
+    class FirstInvalidThenValid(EvidenceKimi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.kwargs_seen: list[dict] = []
+
+        def chat(self, messages, **kwargs):
+            self.kwargs_seen.append(dict(kwargs))
+            if len(self.kwargs_seen) == 1:
+                return "not-json"
+            return super().chat(messages, **kwargs)
+
+    client = FirstInvalidThenValid()
+    bundle, _ = EvidenceIndexer(client, PROJECT_ROOT / "prompts").build(source)
+
+    assert bundle.long_mode is True
+    assert client.kwargs_seen[0]["reasoning_effort"] == "high"
+    assert client.kwargs_seen[1]["reasoning_effort"] == "low"
+
+
+_SURVEY_WORDS = [
+    "归纳偏置", "奖励整形", "课程学习", "策略蒸馏", "轨迹压缩", "约束传播",
+    "反向信用", "探索噪声", "价值分解", "离线微调", "对抗鲁棒", "符号接地",
+    "工具调用", "记忆回流", "任务分解", "自我批判", "多轮规划", "安全护栏",
+]
+
+
+def _survey_bundle() -> tuple[EvidenceBundle, list[SourceChunk]]:
+    """2509 规模假综述：18 章 × ~18k ≈ 325k 字符，每块配一张真实证据卡。"""
+    md = "\n\n".join(
+        f"## 第 {i} 章\n" + (f"本章讨论{_SURVEY_WORDS[i - 1]}。" * 2_000)
+        for i in range(1, 19)
+    )
+    chunks = split_source(md)
+    cards = [
+        EvidenceCard(
+            chunk_id=chunk.chunk_id,
+            section=chunk.title,
+            orientation=f"{chunk.title} 概览",
+            claims=[f"{chunk.title} 的核心主张"],
+        )
+        for chunk in chunks
+    ]
+    return EvidenceBundle(chunks=chunks, cards=cards, long_mode=True), chunks
+
+
+def test_layered_source_packet_covers_every_chunk_within_budget():
+    """长文分层包：命中块全文 + 未命中块证据卡摘要，不超预算、不截尾、不降级。"""
+    bundle, chunks = _survey_bundle()
+    refs = [chunks[1].chunk_id, chunks[7].chunk_id, chunks[16].chunk_id]
+    packet = bundle.layered_source_packet_info(refs, hints=[], max_chars=250_000)
+
+    assert len(packet.text) <= 250_000
+    assert packet.used_fallback is False          # 不再报「退回关键词召回」降级
+    assert not packet.omitted_ids and not packet.truncated_ids
+    assert packet.complete is True
+    for chunk in chunks:
+        assert chunk.chunk_id in packet.text      # 任何块都不截尾丢弃
+    for chunk in (chunks[1], chunks[7], chunks[16]):
+        assert f"SOURCE {chunk.chunk_id}" in packet.text
+        assert chunk.text in packet.text          # 命中块全文装入
+    assert f"SUMMARY {chunks[0].chunk_id}" in packet.text
+    assert f"SUMMARY {chunks[-1].chunk_id}" in packet.text  # 尾部块以摘要保留
+    assert "的核心主张" in packet.text             # 未命中块用证据卡 statements
+
+
+def test_layered_source_packet_demotes_overflow_fulltext_to_summary():
+    """全文候选超预算时，多出的候选自动降为摘要块：不省略、不截断、不超预算。"""
+    bundle, chunks = _survey_bundle()
+    refs = [chunk.chunk_id for chunk in chunks[:6]]
+    packet = bundle.layered_source_packet_info(refs, hints=[], max_chars=100_000)
+
+    assert len(packet.text) <= 100_000
+    assert packet.used_fallback is False
+    assert not packet.omitted_ids and not packet.truncated_ids
+    full = [chunk for chunk in chunks if f"SOURCE {chunk.chunk_id}" in packet.text]
+    assert 0 < len(full) < 6                      # 装不下的候选降级为摘要
+    for chunk in chunks:
+        assert chunk.chunk_id in packet.text      # 仍没有任何块被丢弃
+
+
+def test_layered_source_packet_promotes_hint_matched_chunks_without_fallback():
+    """无精确引用时提示词只决定哪些块提升为全文，不再构成召回降级。"""
+    bundle, chunks = _survey_bundle()
+    packet = bundle.layered_source_packet_info([], hints=["奖励整形 设计"], max_chars=250_000)
+
+    assert packet.used_fallback is False
+    assert f"SOURCE {chunks[1].chunk_id}" in packet.text   # 提示词命中的块给全文
+    assert f"SUMMARY {chunks[0].chunk_id}" in packet.text  # 其余块摘要兜底
+
+
+def test_evidence_card_first_attempt_preserves_reasoning_quality():
+    """证据卡首轮用 high；只有格式/空输出纠错才允许降为 low。"""
+    source = "# 综述\n\n" + "研究内容。" * 45_000 + "\n\n## 结论\n\n尾部结论"
+
+    class KwargRecorder(EvidenceKimi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.kwargs_seen: list[dict] = []
+
+        def chat(self, messages, **kwargs):
+            self.kwargs_seen.append(dict(kwargs))
+            return super().chat(messages, **kwargs)
+
+    client = KwargRecorder()
+    bundle, calls = EvidenceIndexer(client, PROJECT_ROOT / "prompts").build(source)
+    assert bundle.long_mode is True and calls > 0
+    assert client.kwargs_seen
+    assert all(kwargs.get("reasoning_effort") == "high" for kwargs in client.kwargs_seen)
+    assert all("low_reasoning" not in kwargs for kwargs in client.kwargs_seen)

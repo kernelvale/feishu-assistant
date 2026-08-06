@@ -123,6 +123,9 @@ TABLE_SCHEMAS: dict[str, list[FieldSpec]] = {
         _text("内容"),
         _multi("标签"),
         _single("方向", ("Agent Harness", "大模型开发", "其他")),
+        _text("关联论文"),
+        _text("论文ID"),
+        _url("论文链接"),
         _date("时间"),
     ],
     "求职看板": [

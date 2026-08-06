@@ -3020,8 +3020,8 @@ def test_fault_injection_structure_damage_annotates_not_kills(tmp_path):
 
 def test_fault_evidence_api_error_degrades_to_nav_cards(tmp_path):
     """#1 Evidence API 异常 → 确定性重建分块+全部原文导航卡降级，正文照交。"""
-    long_paper = (_PAPER + "\n\n") * 2400  # > 120k 触发长文证据索引
-    assert len(long_paper) > 120_000
+    long_paper = (_PAPER + "\n\n") * 4000  # > 200k 触发统一长文证据索引
+    assert len(long_paper) > 200_000
 
     class EvidenceDown(FakeKimiReading):
         def chat(self, messages, *, heavy=False, json_mode=False, low_reasoning=False,
@@ -3042,7 +3042,7 @@ def test_fault_evidence_api_error_degrades_to_nav_cards(tmp_path):
     assert result.body_md  # final-body 非空
     assert result.metadata.get("evidence_issues")  # 导航卡降级标注进结果卡
     evidence_calls = [c for c in kimi.calls if c[0] == "evidence"]
-    assert 1 <= len(evidence_calls) <= 8  # 每块至多一次，失败即降级不重试风暴
+    assert 1 <= len(evidence_calls) <= 12  # 每块至多一次，失败即降级不重试风暴
     assert result.model_calls <= 40  # 明确总上限
 
 

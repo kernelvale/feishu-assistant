@@ -161,6 +161,11 @@ class CardSender(FakeSender):
         self.reactivations += 1
         return self.reactivate_ok
 
+    def status_card_append(self, card_id, content):
+        self.appends = getattr(self, "appends", [])
+        self.appends.append((card_id, content))
+        return getattr(self, "append_code", "")
+
 
 def test_card_channel_preferred_when_available():
     """sender 有流式卡通道 → 走卡片不走文本消息，PATCH 全流式。"""
@@ -884,3 +889,81 @@ def test_stats_baseline_delta():
     total["calls"] += 18
     total["cached"] += 45200
     assert "· 调用 18 次 · 缓存 45.2k" in card._stats_line()
+
+
+def test_taskcard_finish_with_result_appends_result_element():
+    """result_md 非空：结果区追加进同一卡片（元素追加），不再单独发结果卡。"""
+    sender = CardSender()
+    card = _make_card(sender).start()
+    card.set_stage(0)
+    card.finish(ok=True, note="精读完成",
+                result_md="**📄 精读结果**\n📖 [打开精读文档](http://doc)")
+    appends = getattr(sender, "appends", [])
+    assert len(appends) == 1
+    assert appends[0][0] == "card_1" and "打开精读文档" in appends[0][1]
+    footer_final = [t for h, t in sender.card_updates if h.endswith("footer_line")][-1]
+    assert "精读完成" in footer_final and "打开精读文档" not in footer_final  # 页脚不混入
+
+
+def test_taskcard_finish_result_append_fails_falls_back_to_footer():
+    """追加失败（含重激活后仍失败）：结果并入页脚，信息不丢。"""
+    sender = CardSender()
+    sender.append_code = "200850"  # 流式窗口关闭 → 重激活后仍失败
+    card = _make_card(sender).start()
+    card.set_stage(0)
+    card.finish(ok=True, note="精读完成", result_md="**📄 精读结果**\n关键信息")
+    footer_final = [t for h, t in sender.card_updates if h.endswith("footer_line")][-1]
+    assert "关键信息" in footer_final  # 兜底并入页脚
+    assert sender.reactivations >= 1  # 触发过重激活重试
+
+
+def test_taskcard_done_stage_sanitizes_v9_inprogress_wording():
+    """V9 措辞（「正在建立/正在并列执行」）同样属于进行中痕迹，打勾即清。"""
+    card = _make_card()
+    card.set_stage(1, "V9 正在建立来源导航")
+    card.set_stage(2, "V9 作者正在建立轻量叙事简报")
+    assert card._stages[1]["detail"] == ""  # 🌟 行下不应残留「正在」
+    card.set_stage(3, "单一作者正在写正文")
+    assert card._stages[2]["detail"] == ""
+
+
+def test_taskcard_takeover_resumes_existing_card(tmp_path):
+    """原卡接管：有状态文件时不再创建新卡——重激活旧卡并把当前状态刷进去。"""
+    state = tmp_path / "card.json"
+    sender1 = CardSender()
+    card1 = _make_card(sender1, state_path=state).start()
+    card1.set_stage(2, "教学计划生成中……")
+    card1._tick()
+    card_id_1 = card1._msg_id
+    # 模拟进程重启：新 sender + 新 TaskCard，同一状态文件
+    sender2 = CardSender()
+    card2 = _make_card(sender2, state_path=state).start()
+    assert card2._msg_id == card_id_1  # 接管旧卡，没建新卡
+    assert len(sender2.sent) == 0  # 没有首发新卡片
+    assert sender2.reactivations >= 1  # 重激活了
+    # 旧卡阶段状态被接管恢复（直跳 stage 2，所以它是 current）
+    assert card2._stages[2]["state"] == "current"
+    assert "教学计划" in card2._stages[2]["detail"]
+
+
+def test_taskcard_takeover_failure_creates_new_card(tmp_path):
+    """接管失败（旧卡已被删除等）：回落到新建卡。"""
+    state = tmp_path / "card.json"
+    state.write_text('{"card_id": "card_gone", "stages": []}', encoding="utf-8")
+    sender = CardSender()
+    sender.reactivate_ok = False  # 重激活失败
+    card = _make_card(sender, state_path=state).start()
+    assert card._msg_id == "card_1"  # 新建卡（CardSender.rich_card_create 的返回值）
+    assert len(sender.sent) == 1
+
+
+def test_taskcard_finish_discards_state(tmp_path):
+    """定格后删除状态文件：下一次同论文启动新卡而非接管已完成卡。"""
+    state = tmp_path / "card.json"
+    sender = CardSender()
+    card = _make_card(sender, state_path=state).start()
+    card.set_stage(0)
+    card._tick()
+    assert state.exists()
+    card.finish(ok=True, note="完成")
+    assert not state.exists()

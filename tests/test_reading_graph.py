@@ -241,7 +241,7 @@ def test_validate_graph_for_plan_fail_closed():
 def test_evidence_card_cache_signature(tmp_path):
     """卡签名：chunk digest 不一致 → 重建；一致 → 命中零调用。"""
     from feishu_assistant.modules.reading import ReadingWorkspace
-    source = "# 综述\n\n" + "研究内容。" * 25_000 + "\n\n## 结论\n\n尾部结论"
+    source = "# 综述\n\n" + "研究内容。" * 45_000 + "\n\n## 结论\n\n尾部结论"
     ws = ReadingWorkspace(tmp_path)
     client = EvidenceKimi()
     bundle1, calls1 = EvidenceIndexer(client, PROJECT_ROOT / "prompts").build(

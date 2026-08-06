@@ -43,7 +43,7 @@ from .modules.digest import (
 )
 from .lifecycle import PaperCache, StoragePolicy, cleanup_sensitive_roots
 from .modules.paper import PAPERS_DIR
-from .modules.inbox import InboxService
+from .modules.inbox import InboxService, has_explicit_archive_intent
 from .modules.paper import PaperReadingService
 from .modules.router import Router
 from .modules.session import ContextBudget, SessionService
@@ -365,8 +365,12 @@ def cmd_start(settings: Settings) -> int:
         chat_id=settings.push_chat_id,
     )
     router.digest_svc = digest_service
-    inbox_service = InboxService(settings, kimi, io=career_io)
+    inbox_service = InboxService(
+        settings, kimi, io=career_io,
+        session_store=session_service.store, paper_store=paper_store,
+    )
     router.inbox_fn = inbox_service.try_handle
+    router.inbox_priority_fn = has_explicit_archive_intent
 
     # lark-oapi 的 ws.Client.start() 是阻塞式的，
     # 定时任务因此用 BackgroundScheduler（后台线程），两者互不影响。

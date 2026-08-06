@@ -21,6 +21,8 @@ from feishu_assistant.modules.paper import (
     PaperReadingService,
     _classify_error,
     _is_transient_error,
+    _retrieve_sections_info,
+    _result_markdown,
     build_error_card,
     build_paper_row,
     build_result_card,
@@ -196,6 +198,28 @@ def test_result_card_not_archived_note():
     assert "归档未成功" in str(card["elements"])
 
 
+def test_result_area_surfaces_unresolved_p2_fact_issues():
+    meta = {
+        "title_zh": "自动马具",
+        "tldr": "一句话总结",
+        "release_status": "verified_final",
+        "unresolved_p2_fact_issues": [
+            {
+                "problem": "合计成本被写成每组各 640 美元。",
+                "required_outcome": "改为两组实验合计约 640 美元。",
+            }
+        ],
+    }
+
+    result = _result_markdown(meta, "", "2603.03329", archived=True)
+    card = build_result_card(meta, "", "2603.03329", archived=True)
+
+    assert "未自动修订的事实提醒" in result
+    assert "640 美元" in result
+    assert "未自动修订的事实提醒" in str(card["elements"])
+    assert card["header"]["template"] == "orange"
+
+
 def test_error_card_has_reason_and_suggestion():
     card = build_error_card("《x》", "解析失败", "换 PDF 重试")
     assert card["header"]["template"] == "red"
@@ -221,7 +245,12 @@ def test_looks_like_followup_hit(text):
     assert looks_like_followup(text)
 
 
-@pytest.mark.parametrize("text", ["今天天气怎么样", "帮我写个周报", "你好"])
+@pytest.mark.parametrize("text", [
+    "今天天气怎么样", "帮我写个周报", "你好",
+    "这是我对概率续写的表面理解",
+    "第一个方案先做缓存",
+    "图灵奖为什么重要",
+])
 def test_looks_like_followup_miss(text):
     assert not looks_like_followup(text)
 
@@ -230,8 +259,8 @@ class _FakeKimi:
     def __init__(self):
         self.calls = []
 
-    def chat(self, messages, *, heavy=False, json_mode=False):
-        self.calls.append({"messages": messages, "heavy": heavy})
+    def chat(self, messages, *, heavy=False, json_mode=False, **kwargs):
+        self.calls.append({"messages": messages, "heavy": heavy, "kwargs": kwargs})
         return "追问回答"
 
 
@@ -574,13 +603,13 @@ class _FakeStatus:
 
     def __init__(self):
         self.stages: list[str] = []
-        self.stopped: list[tuple[bool, str]] = []
+        self.stopped: list[tuple[bool, str, str]] = []
 
     def set_stage(self, stage: str) -> None:
         self.stages.append(stage)
 
-    def stop(self, ok: bool, note: str = "") -> None:
-        self.stopped.append((ok, note))
+    def stop(self, ok: bool, note: str = "", result_md: str = "") -> None:
+        self.stopped.append((ok, note, result_md))
 
 
 class _RecordingSender(_FakeSender):
@@ -644,9 +673,10 @@ def test_run_guarded_transient_retry_recovers(tmp_path, monkeypatch):
         "🌐 网络中断，2 分钟后自动重试（第 1/3 次）",
         "🌐 网络中断，5 分钟后自动重试（第 2/3 次）",
     ]
-    assert status.stopped == [(True, "精读完成，文档与详情见下方结果卡")]
-    assert len(svc.sender.cards) == 1  # 结果卡而非错误卡
-    assert svc.sender.cards[0]["header"]["template"] == "green"
+    assert status.stopped == [(True, "精读完成，结果见本卡",
+                               status.stopped[0][2])]  # note 更新为「结果见本卡」
+    assert "打开精读文档" in status.stopped[0][2]  # 结果区并入任务卡定格帧
+    assert not svc.sender.cards  # 不再单独发结果卡
     assert svc.task_store.get("k1").status == "done"
 
 
@@ -665,9 +695,9 @@ def test_run_guarded_transient_retry_exhausted_sends_error_card(tmp_path, monkey
 
     svc._run_guarded(ctx, "L", always_down, {}, status, "k2")
 
-    assert len(calls) == 1 + len(TRANSIENT_RETRY_BACKOFFS)  # 首次 + 3 次重试
-    assert delays == list(TRANSIENT_RETRY_BACKOFFS)  # 2/5/10 分钟全部等过
-    assert len(status.stages) == 3 and "第 3/3 次" in status.stages[-1]
+    assert len(calls) == 1 + len(TRANSIENT_RETRY_BACKOFFS) + 6  # 首次 + 3 ladder + 6 次长候
+    assert delays == list(TRANSIENT_RETRY_BACKOFFS) + [600] * 6  # ladder 后长候每 10 分钟
+    assert "第 3/3 次" in status.stages[2] and "等待网络恢复" in status.stages[-1]
     assert status.stopped[-1][0] is False  # ❌ 定格
     assert len(svc.sender.cards) == 1
     assert svc.sender.cards[0]["header"]["template"] == "red"  # 错误卡
@@ -769,9 +799,10 @@ def test_run_guarded_transient_exhausted_enqueues_warning_then_failure(tmp_path,
     svc._run_guarded(MessageContext(chat_id="c1"), "L", always_down, {}, _FakeStatus(), "kn3")
 
     texts = [t for _, t in outbox.items]
-    assert len(texts) == 2
+    assert len(texts) == 3
     assert texts[0].startswith("⚠️ 精读L遇到网络问题")
-    assert texts[1].startswith("❌ 精读L失败：") and "可重发链接重试" in texts[1]
+    assert "转入长候模式" in texts[1]  # ladder 耗尽转长候的告知
+    assert texts[2].startswith("❌ 精读L失败：") and "可重发链接重试" in texts[2]
 
 
 def test_run_guarded_without_outbox_notifications_silently_off(tmp_path, monkeypatch):
@@ -784,7 +815,7 @@ def test_run_guarded_without_outbox_notifications_silently_off(tmp_path, monkeyp
 
     svc._run_guarded(MessageContext(chat_id="c1"), "L", always_down, {}, _FakeStatus(), "kn4")
     assert svc.sender.cards[0]["header"]["template"] == "red"
-    assert delays == list(TRANSIENT_RETRY_BACKOFFS)
+    assert delays == list(TRANSIENT_RETRY_BACKOFFS) + [600] * 6
 
 
 def test_start_async_wires_stuck_alert_to_outbox(tmp_path):
@@ -1043,6 +1074,358 @@ def test_run_guarded_degraded_v9_does_not_claim_final_review_pass(tmp_path):
 
     svc._run_guarded(MessageContext(chat_id="c1"), "L", degraded_job, {}, status, "")
 
-    assert status.stopped == [(True, "精读完成，发布状态：事实审查未完成")]
+    assert status.stopped[0][0] is True
+    assert status.stopped[0][1] == "精读完成，发布状态：事实审查未完成"
     assert "通过终审" not in status.stopped[0][1]
-    assert svc.sender.cards[0]["header"]["template"] == "orange"
+    assert "事实审查未完成" in status.stopped[0][2]  # 降级状态并入结果区
+    assert "系统没有合成终审通过" in status.stopped[0][2]
+    assert not svc.sender.cards  # 降级结果也并入任务卡，不单独发卡
+
+
+def test_run_with_transient_retry_syncs_param_status_into_context(tmp_path):
+    """入口只传 status 参数（脚本路径）时，入口自动挂到 context.status——
+    封死「只传参没挂上下文」导致的静默僵尸卡（进度分发读 context.status）。"""
+    svc = _make_service(tmp_path, _FakeKimi(), sender=_FakeSender())
+    ctx = MessageContext(chat_id="c1", open_id="ou_x")
+    status = _FakeStatus()
+
+    def ok_job(context, **_):
+        assert context.status is status  # 入口已同步
+        svc._progress(context, "🧠 教学计划生成中……")  # 进度分发真实到达 status
+        return {"title_zh": "论文", "tldr": "x"}, "http://doc", True
+
+    svc._run_with_transient_retry(ctx, "L", ok_job, {}, status)
+    assert status.stages == ["🧠 教学计划生成中……"]  # 进度没有丢进空指针
+
+
+def test_run_guarded_calls_on_done_with_arxiv_id(tmp_path):
+    """完成钩子拿到 arxiv_id（钉住 NameError 回归：绑定会话靠它创建）。"""
+    svc = _make_service(tmp_path, _FakeKimi(), sender=_FakeSender())
+    seen = {}
+
+    def ok_job(context, **kwargs):
+        return {"title_zh": "论文", "tldr": "x"}, "http://doc", True
+
+    svc.on_done = lambda context, title, arxiv_id: seen.update(
+        title=title, arxiv_id=arxiv_id) or "已切换"
+    svc._run_guarded(MessageContext(chat_id="c1"), "L", ok_job,
+                     {"arxiv_id": "2603.03329"}, _FakeStatus(), "")
+    assert seen == {"title": "论文", "arxiv_id": "2603.03329"}
+
+
+def test_run_guarded_calls_on_done_with_attachment_paper_ref(tmp_path):
+    """无 arXiv 附件也要把本地论文标识绑定进会话，供灵感关联与问答定位。"""
+    svc = _make_service(tmp_path, _FakeKimi(), sender=_FakeSender())
+    seen = {}
+
+    def ok_job(context, **kwargs):
+        return {
+            "title_zh": "附件论文", "tldr": "x", "_paper_ref": "attach_123"
+        }, "http://doc", True
+
+    svc.on_done = lambda context, title, paper_ref: seen.update(
+        title=title, paper_ref=paper_ref) or "已切换"
+    svc._run_guarded(
+        MessageContext(chat_id="c1"), "L", ok_job, {}, _FakeStatus(), ""
+    )
+    assert seen == {"title": "附件论文", "paper_ref": "attach_123"}
+
+
+# ---- 追问上下文实战化（缓存哨兵 / 长文检索 / 多轮历史）----
+
+
+def _long_paper_md() -> str:
+    """构造超过 SHORT_PAPER_CHARS 的长文：摘要 + 方法 + 附录大段内容。"""
+    from feishu_assistant.modules.reading_evidence import SHORT_PAPER_CHARS
+    head = "## Abstract\n本文提出一种方法。\n\n## Introduction\n引言内容。\n\n"
+    body = ""
+    for i in range(6):
+        body += f"## 无关章节 {i}\n" + ("无关内容。" * 2000) + "\n\n"
+    tail = "## 附录 D：代码样例\nMinesweeper 的子集消元推理规则。\n"
+    pad = SHORT_PAPER_CHARS - len(head) - len(body) - len(tail) + 1000
+    # 填充后必须补换行：否则附录标题贴在填充行中间，不再是独立章节
+    return head + body + ("填充。" * max(0, pad // 3)) + "\n\n" + tail
+
+
+def _paper_session(bind_ref="2603.03329"):
+    from feishu_assistant.store import Session
+    return Session(id=1, chat_id="c1", title="精读", bind_type="paper",
+                   bind_ref=bind_ref, status="active", summary="",
+                   custom_title=False, created_at=0, last_active=0)
+
+
+def _msg(role, content):
+    from feishu_assistant.store import Message
+    return Message(id=0, session_id=1, role=role, content=content,
+                   tokens=0, provider="", model="", created_at=0)
+
+
+def test_answer_in_session_has_cache_break_and_fulltext_for_short_paper(tmp_path):
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper("c1", "2603.03329", "短论文", "## 方法\n全部正文")
+    session = _paper_session()
+    reply = svc.answer_in_session(session, "方法怎么做的")
+    assert reply == "追问回答"
+    content = kimi.calls[0]["messages"][1]["content"]
+    assert "<!--CACHE_BREAK-->" in content
+    # 论文全文在哨兵之前（前缀可缓存），问题在哨兵之后
+    assert content.index("全部正文") < content.index("<!--CACHE_BREAK-->")
+    assert content.index("方法怎么做的") > content.index("<!--CACHE_BREAK-->")
+
+
+def test_answer_in_session_includes_recent_history(tmp_path):
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper("c1", "2603.03329", "短论文", "正文")
+    session = _paper_session()
+    history = [_msg("user", "上一问：什么是 harness"),
+               _msg("assistant", "上一答：harness 是外壳代码"),
+               _msg("user", "那它怎么学出来的")]  # 当前问题已落库（尾随未答不成对）
+    svc.answer_in_session(session, "那它怎么学出来的", history_msgs=history)
+    content = kimi.calls[0]["messages"][1]["content"]
+    assert "对话记录" in content and "什么是 harness" in content
+    # 历史在哨兵之后（不破坏前缀缓存）
+    assert content.index("对话记录") > content.index("<!--CACHE_BREAK-->")
+
+
+def test_answer_in_session_long_paper_uses_retrieval(tmp_path):
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper("c1", "2603.03329", "长论文", _long_paper_md())
+    session = _paper_session()
+    svc.answer_in_session(session, "附录 D 的子集消元推理怎么写")
+    content = kimi.calls[0]["messages"][1]["content"]
+    assert "按问题检索的相关块" in content
+    assert "子集消元推理" in content  # 相关章节被检索到
+    assert "未展开的章节" in content  # 未选中的给清单
+    assert "无关章节 3" not in content.split("未展开")[0]  # 无关章节没进正文区
+    assert kimi.calls[0]["kwargs"]["reasoning_effort"] == "high"
+    assert kimi.calls[0]["kwargs"]["max_tokens"] == 16_384
+
+
+def _three_block_paper_md() -> str:
+    """目标块 + 摘要/结论 + 无关大块：总长超过统一分档阈值，走长文检索路径。"""
+    from feishu_assistant.modules.reading_evidence import SHORT_PAPER_CHARS
+    head = "## Abstract\n本文研究强化学习训练的稳定性。\n\n"
+    target = "## 蒸馏温度实验\n蒸馏温度系数 tau 取 2.0 时收敛最快，过大或过小都变慢。\n\n"
+    tail = "## Conclusion\n结论：定点反馈与温度调度共同决定收敛。\n"
+    pad = SHORT_PAPER_CHARS - len(head) - len(target) - len(tail) + 500
+    filler = "## 相关工作综述\n" + ("铺陈背景。" * (pad // 5)) + "\n"
+    return head + target + filler + tail
+
+
+def test_answer_in_session_long_paper_retrieves_only_relevant_block(tmp_path):
+    """长文追问：问题命中目标块 → 只带目标块 + Abstract/Conclusion，无关大块不进正文区。"""
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper("c1", "2603.03329", "长论文", _three_block_paper_md())
+    session = _paper_session()
+    svc.answer_in_session(session, "蒸馏温度系数 tau 怎么取的")
+    content = kimi.calls[0]["messages"][1]["content"]
+    assert "按问题检索的相关块" in content
+    body = content.split("未展开")[0]
+    assert "蒸馏温度系数" in body   # 问题命中的块
+    assert "Abstract" in body       # 摘要必带
+    assert "Conclusion" in body     # 结论必带
+    assert "铺陈背景" not in body    # 无关大块不进正文区
+
+
+def test_answer_in_session_long_paper_low_confidence_fails_closed_to_navigation(tmp_path):
+    """检索置信低时只给摘要/目录，不把全文前缀冒充相关证据。"""
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper("c1", "2603.03329", "长论文", _three_block_paper_md())
+    session = _paper_session()
+    svc.answer_in_session(session, "量子引力曲率流形怎么定义")
+    content = kimi.calls[0]["messages"][1]["content"]
+    assert "按问题检索的相关块" not in content
+    assert "检索未命中" in content
+    assert "章节目录" in content
+    assert "铺陈背景" not in content
+
+
+def test_long_followup_retrieval_finds_answer_deep_inside_large_section(tmp_path):
+    """不能只看章节标题和前 600 字；答案在章节深处也应命中对应块。"""
+    deep = (
+        "## 方法细节\n" + "前置铺垫，与目标问题无关。" * 2_500
+        + "\n深处唯一证据：温度退火在第 12 轮切换为余弦调度。\n"
+        + "后续讨论。" * 600
+    )
+    paper = (
+        "## Abstract\n本文研究训练调度。\n\n"
+        + deep
+        + "\n\n## 大段相关工作\n" + "无关综述。" * 40_000
+        + "\n\n## Conclusion\n结论只做总览。"
+    )
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper("c1", "2603.03329", "深层答案长论文", paper)
+
+    svc.answer_in_session(_paper_session(), "第 12 轮温度退火怎么调度")
+    content = kimi.calls[0]["messages"][1]["content"]
+
+    assert "按问题检索的相关块" in content
+    assert "深处唯一证据" in content
+    assert "无关综述" not in content.split("未展开")[0]
+
+
+def test_long_followup_retrieval_packet_never_exceeds_budget():
+    paper = _three_block_paper_md()
+    packet = _retrieve_sections_info(paper, "蒸馏温度系数 tau 怎么取", budget=8_000)
+
+    assert packet.text is not None
+    assert len(packet.text) <= 8_000
+    assert any("蒸馏温度实验" in location for location in packet.selected_locations)
+
+
+def test_run_with_transient_retry_long_wait_mode(tmp_path, monkeypatch):
+    """长候模式：ladder 耗尽后每 10 分钟重试，撑满 60 分钟预算才放弃。"""
+    import feishu_assistant.modules.paper as paper_mod
+    clock = [1_000_000.0]
+    delays: list[float] = []
+
+    def fake_sleep(s):
+        delays.append(s)
+        clock[0] += s
+
+    monkeypatch.setattr(paper_mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(paper_mod.time, "time", lambda: clock[0])
+    svc = _make_service(tmp_path, _FakeKimi(), sender=_FakeSender())
+    status = _FakeStatus()
+
+    def always_down(context, **_):
+        raise httpx.ConnectError("down")
+
+    with pytest.raises(httpx.ConnectError):
+        svc._run_with_transient_retry(
+            MessageContext(chat_id="c1"), "L", always_down, {}, status)
+    assert delays[:3] == [120, 300, 600]  # 原 ladder 不变
+    assert delays[3:] == [600] * 6  # 长候期固定 10 分钟 ×6 次封顶
+    assert any("等待网络恢复" in s for s in status.stages)
+
+
+def test_run_with_transient_retry_long_wait_recovers(tmp_path, monkeypatch):
+    """长候中网络恢复：ladder + 长候若干次后成功，正常返回。"""
+    import feishu_assistant.modules.paper as paper_mod
+    clock = [1_000_000.0]
+    monkeypatch.setattr(paper_mod.time, "sleep",
+                        lambda s: clock.__setitem__(0, clock[0] + s))
+    monkeypatch.setattr(paper_mod.time, "time", lambda: clock[0])
+    svc = _make_service(tmp_path, _FakeKimi(), sender=_FakeSender())
+    calls: list[int] = []
+
+    def flaky(context, **_):
+        calls.append(1)
+        if len(calls) <= 5:  # ladder 3 次 + 长候 2 次都失败
+            raise httpx.ConnectError("down")
+        return {"title_zh": "ok"}, "http://doc", True
+
+    metadata, doc_url, _ = svc._run_with_transient_retry(
+        MessageContext(chat_id="c1"), "L", flaky, {}, _FakeStatus())
+    assert doc_url == "http://doc"
+    assert len(calls) == 6  # 1 初始 + 3 ladder + 1 长候失败 + 1 长候成功
+
+
+class _FakeVecIndex:
+    def __init__(self, hits):
+        self._hits = hits
+
+    def search(self, *a, **kw):
+        return self._hits
+
+
+def test_followup_picks_semantically_matching_paper_not_latest(tmp_path):
+    """追问关联语义化：问题讲的是上上篇（老论文），不应关联到最新一篇。"""
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    # 老论文（上上篇）与新论文（上篇）：latest 会是新的，但问题语义指向老的
+    svc.store.save_paper("c1", "2603.03329", "AutoHarness 代码护栏",
+                         "## 合法动作率\n正文", created_at=time.time() - 7200)
+    svc.store.save_paper("c1", "2509.08827", "RLVR 综述",
+                         "## 强化学习\n正文", created_at=time.time() - 100)
+    svc.vector_index = _FakeVecIndex([("2603.03329", "AutoHarness 代码护栏", 0.12)])
+    ctx = MessageContext(chat_id="c1", open_id="ou_x")
+    reply = svc.answer_followup("这篇论文的合法动作率怎么做到 100% 的", ctx)
+    assert reply == "追问回答"
+    content = kimi.calls[0]["messages"][1]["content"]
+    assert "AutoHarness 代码护栏" in content and "RLVR 综述" not in content
+
+
+def test_followup_bigram_uses_tldr_and_headings_before_latest(tmp_path):
+    """中文 TLDR/小标题覆盖率足够高时，可越过最新论文直接选中目标篇。"""
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper(
+        "c1", "2603.03329", "AutoHarness 代码护栏", "## Method\n正文",
+        created_at=time.time() - 7200,
+        association_text="AutoHarness\n通过约束满足生成合法动作，合法动作率达到 100%\n方法\n实验结果",
+    )
+    svc.store.save_paper(
+        "c1", "2509.08827", "RLVR 综述", "## 强化学习\n正文",
+        created_at=time.time() - 100,
+        association_text="大推理模型强化学习综述\n奖励设计与策略优化\n训练资源",
+    )
+    reply = svc.answer_followup(
+        "这篇论文的合法动作率怎么做到 100% 的", MessageContext(chat_id="c1")
+    )
+    assert reply == "追问回答"
+    content = kimi.calls[0]["messages"][1]["content"]
+    assert "AutoHarness 代码护栏" in content and "RLVR 综述" not in content
+
+
+def test_followup_mid_distance_asks_then_accepts_one_tap_choice(tmp_path):
+    """0.2~0.45 不硬选：先列 1/2，用户下一条短回复再真正调用模型。"""
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper(
+        "c1", "2603.03329", "AutoHarness 代码护栏", "## Method\n正文",
+        created_at=time.time() - 7200,
+    )
+    svc.store.save_paper(
+        "c1", "2509.08827", "RLVR 综述", "## 强化学习\n正文",
+        created_at=time.time() - 100,
+    )
+    svc.vector_index = _FakeVecIndex([("2509.08827", "RLVR 综述", 0.296)])
+    ctx = MessageContext(chat_id="c1")
+
+    prompt = svc.answer_followup("这篇论文里规则幻觉该怎么理解", ctx)
+    assert prompt is not None and "避免硬关联" in prompt and "回复 1 或 2" in prompt
+    assert kimi.calls == []
+
+    reply = svc.answer_followup("2", ctx)
+    assert reply == "追问回答"
+    assert "AutoHarness 代码护栏" in kimi.calls[0]["messages"][1]["content"]
+
+
+def test_followup_vector_hit_from_other_chat_is_ignored(tmp_path):
+    """向量索引是全库的，但候选必须先按 chat 收窄，不能跨 chat 串论文。"""
+    kimi = _FakeKimi()
+    svc = _make_service(tmp_path, kimi)
+    svc.store.save_paper("c1", "a", "会话一论文 A", "## 方法 A\n正文")
+    svc.store.save_paper("c1", "b", "会话一论文 B", "## 方法 B\n正文")
+    svc.store.save_paper("c2", "foreign", "其他会话论文", "## 外部\n正文")
+    svc.vector_index = _FakeVecIndex([("foreign", "其他会话论文", 0.01)])
+
+    prompt = svc.answer_followup("这篇论文的方法有什么局限", MessageContext(chat_id="c1"))
+    assert prompt is not None and "其他会话论文" not in prompt
+    assert kimi.calls == []
+
+
+def test_paper_store_migrates_and_roundtrips_association_text(tmp_path):
+    """旧 papers 表启动时自动补列，新关联文本可正常读写。"""
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE papers ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, "
+            "arxiv_id TEXT NOT NULL, title TEXT NOT NULL, markdown TEXT NOT NULL, "
+            "doc_url TEXT NOT NULL DEFAULT '', pdf_path TEXT NOT NULL DEFAULT '', "
+            "created_at REAL NOT NULL)"
+        )
+    store = PaperStore(db)
+    store.save_paper("c1", "x", "标题", "正文", association_text="TLDR\n章节")
+    paper = store.latest_paper("c1")
+    assert paper is not None and paper.association_text == "TLDR\n章节"

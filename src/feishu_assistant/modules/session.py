@@ -11,6 +11,9 @@
 - 绑定会话：精读完成后自动建「《标题》精读」（bind_type=paper）并切换，
   该会话内所有消息都带论文全文上下文回答
 - 标题：第 2 轮后 light 模型自动起 ≤10 字标题；「改名」覆盖后不再自动起
+- 长期记忆：压缩时 light 模型顺带提炼「类别|内容」入 memories 表（解析失败只丢记忆，
+  不影响摘要）；装配时 persona 之后、摘要之前全量注入（最新 30 条、≤memory_chars 字符，
+  v1 不做检索）；口令「记住 xxx / 忘掉 xxx / 我的记忆」直接管理
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ..kimi import KimiClient, KimiError, is_heavy_task
+from ..kimi import CACHE_BREAK, KimiClient, KimiError, is_heavy_task
 from ..store import Session, SessionStore
 from .chat import load_system_prompt
 from .paper import MessageContext
@@ -38,12 +41,50 @@ _RECALL_STRIP_RE = re.compile(r"上次|之前|以前|早先|刚才|那个|那段
 
 _SUMMARIZE_PROMPT = (
     "以下是对话的历史片段，请把它增量合并进已有摘要（保留关键事实、结论、用户偏好与待办，"
-    "丢弃寒暄与过程性内容，不超过 400 字，直接输出摘要本身）。\n\n"
-    "【已有摘要】\n{summary}\n\n【历史片段】\n{history}"
+    "丢弃寒暄与过程性内容，摘要不超过 400 字）。\n\n"
+    "【已有摘要】\n{summary}\n\n【历史片段】\n{history}\n\n"
+    "【输出格式】\n"
+    "先输出摘要正文。若历史片段中有值得长期记住的事项（用户的偏好、重要事实、项目进展、"
+    "明确决定），在摘要之后另起一行输出「##长期记忆」，其下每行一条，格式「类别|内容」，"
+    "类别限：偏好/事实/项目/决定；没有则不输出该部分。"
 )
 _TITLE_PROMPT = (
     "为以下对话起一个不超过 10 个字的标题（只输出标题本身，不要标点、不要书名号）：\n\n{dialog}"
 )
+
+_MEMORY_SECTION_RE = re.compile(r"#+\s*长期记忆")
+_MEMORY_CATEGORIES = ("偏好", "事实", "项目", "决定")
+MEMORY_INJECT_LIMIT = 30  # 注入条数上限（个人记忆量小，v1 全量注入不做检索）
+
+
+def _split_summary_memories(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """拆压缩输出：「##长期记忆」之前是摘要（主输出），之后每行一条「类别|内容」。
+
+    摘要是主输出、记忆是附加区：没有标记 / 行格式非法 / 类别不在白名单都只丢记忆，
+    摘要原样保留。
+    """
+    m = _MEMORY_SECTION_RE.search(text)
+    if m is None:
+        return text.strip(), []
+    items: list[tuple[str, str]] = []
+    for line in text[m.end():].splitlines():
+        line = line.strip().lstrip("-•*· ").strip()
+        if "|" not in line:
+            continue
+        category, _, content = line.partition("|")
+        category, content = category.strip(), content.strip()
+        if category in _MEMORY_CATEGORIES and content:
+            items.append((category, content))
+    return text[: m.start()].strip(), items
+
+
+def _guess_memory_category(content: str) -> str:
+    """「记住」口令的粗判分类：命中偏好/决定关键词，否则落「备忘」。"""
+    if re.search(r"偏好|我喜欢|我爱|我讨厌|不喜欢|习惯", content):
+        return "偏好"
+    if re.search(r"我决定|决定了|打算|不再", content):
+        return "决定"
+    return "备忘"
 
 
 @dataclass
@@ -55,11 +96,13 @@ class ContextBudget:
     recent_rounds: int = 10
     recent_tokens: int = 6000
     recall_chars: int = 2000
+    memory_chars: int = 1500
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ContextBudget":
         budget = cls()
-        for key in ("persona_chars", "summary_chars", "recent_rounds", "recent_tokens", "recall_chars"):
+        for key in ("persona_chars", "summary_chars", "recent_rounds", "recent_tokens",
+                    "recall_chars", "memory_chars"):
             if key in d:
                 setattr(budget, key, int(d[key]))
         return budget
@@ -73,6 +116,7 @@ class AssembledContext:
     used_summary: bool
     used_recall: bool
     recent_count: int
+    used_memory: bool = False
 
 
 class SessionService:
@@ -201,6 +245,37 @@ class SessionService:
         pending = self._pending_delete.pop(chat_id, None)
         return pending[1] if pending is not None else None
 
+    # -- 长期记忆口令（「记住」≠ inbox 的「记一下」，后者写备忘库不动）--
+
+    def cmd_remember(self, arg: str, ctx: MessageContext) -> str:
+        content = arg.strip()
+        if not content:
+            return "用法：记住 内容（写入长期记忆，之后对话会自动带上）。"
+        category = _guess_memory_category(content)
+        self.store.add_memory(ctx.chat_id, category, content)
+        logger.info("记住：chat=%s [%s] %s", ctx.chat_id, category, content[:30])
+        return f"✅ 已记住（{category}）：{content}\n发「我的记忆」查看全部，「忘掉 关键词」删除。"
+
+    def cmd_forget(self, arg: str, ctx: MessageContext) -> str:
+        keyword = arg.strip()
+        if not keyword:
+            return "用法：忘掉 关键词（按内容模糊匹配删除长期记忆）。"
+        n = self.store.delete_memory(ctx.chat_id, keyword)
+        if n == 0:
+            return f"没有找到含「{keyword}」的记忆。发「我的记忆」查看全部。"
+        logger.info("忘掉：chat=%s 关键词「%s」删除 %d 条", ctx.chat_id, keyword, n)
+        return f"🗑 已忘掉 {n} 条含「{keyword}」的记忆。"
+
+    def cmd_memories(self, ctx: MessageContext) -> str:
+        memories = self.store.list_memories(ctx.chat_id, limit=100)
+        if not memories:
+            return "还没有长期记忆。发「记住 xxx」写入第一条。"
+        lines = [f"{i}. 【{m.category}】{m.content}" for i, m in enumerate(memories, 1)]
+        return (
+            f"🧠 长期记忆（共 {len(memories)} 条，新的在前）\n" + "\n".join(lines)
+            + "\n管理：记住 xxx / 忘掉 关键词"
+        )
+
     # ------------------------------------------------------------------
     # 自由对话入口（替换原 chat_fn）
     # ------------------------------------------------------------------
@@ -214,7 +289,11 @@ class SessionService:
 
         try:
             if session.bind_type == "paper" and self.paper_qa_fn is not None:
-                reply = self.paper_qa_fn(session, text)
+                # 绑定精读问答：传入最近消息供装配对话记录（当前问题已落库，
+                # 尾随未答的用户消息不会成对，天然被排除在记录外）
+                reply = self.paper_qa_fn(
+                    session, text,
+                    history_msgs=self.store.recent_messages(session.id, limit=12))
                 provider, model = "", ""
             else:
                 recall = self.recall(ctx.chat_id, text, exclude_session_id=session.id)
@@ -248,7 +327,7 @@ class SessionService:
     def assemble_context(
         self, session: Session, recall_text: str | None = None
     ) -> AssembledContext:
-        """系统人设 + 滚动摘要 + 最近 N 轮（token 预算内，含已落库的当前消息）+ 召回片段。
+        """系统人设 + 长期记忆 + 滚动摘要 + 最近 N 轮（token 预算内，含已落库的当前消息）+ 召回片段。
 
         消息历史唯一事实源是 store：调用方须先落库当前消息，装配器不再单独追加，
         模型看到的历史与库内完全一致（不重复、不遗漏）。
@@ -257,6 +336,9 @@ class SessionService:
         system_parts = [self.persona[: b.persona_chars]]
         if session.bind_type == "paper":
             system_parts.append(f"当前会话「{session.title}」绑定论文精读，回答优先基于论文内容。")
+        memory_block = self._memory_block(session.chat_id)
+        if memory_block:
+            system_parts.append(memory_block)
         if session.summary:
             system_parts.append(
                 f"当前会话「{session.title}」前情摘要：\n{session.summary[: b.summary_chars]}"
@@ -267,7 +349,39 @@ class SessionService:
         messages: list[dict[str, str]] = [{"role": "system", "content": "\n\n".join(system_parts)}]
         kept = self._recent_within_budget(session)
         messages += [{"role": m.role, "content": m.content} for m in kept]
-        return AssembledContext(messages, bool(session.summary), bool(recall_text), len(kept))
+        # 增量缓存断点：哨兵标记「稳定前缀 | 当前问题」分界。多轮对话的历史是
+        # 只增不改的，前轮缓存的前缀本轮继续命中——每轮只有最新一轮问答按原价计算。
+        # 人设/记忆/摘要在前缀区：它们变化频率低，变化后下一轮自动重缓存。
+        anchor = messages[-2] if len(messages) > 1 and messages[-1]["role"] == "user" \
+            else messages[0]
+        anchor["content"] = anchor["content"] + "\n" + CACHE_BREAK
+        return AssembledContext(messages, bool(session.summary), bool(recall_text), len(kept),
+                                memory_block is not None)
+
+    def _memory_block(self, chat_id: str) -> str | None:
+        """长期记忆注入区：最新 N 条按时间倒序全量注入，总预算 memory_chars（超出丢最旧的）。
+
+        与召回同理：存储异常只记日志按无记忆处理，不拖垮整轮装配。
+        """
+        try:
+            memories = self.store.list_memories(chat_id, limit=MEMORY_INJECT_LIMIT)
+        except sqlite3.Error as exc:
+            logger.warning("长期记忆读取失败（按无记忆继续）：%s", exc)
+            return None
+        if not memories:
+            return None
+        lines: list[str] = []
+        total = 0
+        for m in memories:  # 新的在前：预算耗尽时最旧的先被丢
+            line = f"【{m.category}】{m.content}"
+            if lines and total + len(line) > self.budget.memory_chars:
+                break
+            lines.append(line)
+            total += len(line)
+        return (
+            "## 长期记忆\n以下是关于用户的长期记忆，供参考，不要逐条复述给用户：\n"
+            + "\n".join(lines)
+        )
 
     def _recent_within_budget(self, session: Session):
         """最近 recent_rounds 轮且总 tokens ≤ recent_tokens（从最新往回装）。"""
@@ -300,7 +414,7 @@ class SessionService:
         )[:12_000]
         fresh = self.store.get_session(session.id) or session
         try:
-            new_summary = self.kimi.chat(
+            raw = self.kimi.chat(
                 [{"role": "user", "content": _SUMMARIZE_PROMPT.format(
                     summary=fresh.summary or "（空）", history=history)}],
                 heavy=False,
@@ -308,9 +422,19 @@ class SessionService:
         except KimiError as exc:
             logger.warning("摘要压缩失败（下轮再试）：%s", exc)
             return False
-        self.store.update_summary(session.id, new_summary.strip())
-        logger.info("会话 %s 摘要已压缩更新（%d 条旧消息 → %d 字符）",
-                    session.code, len(old), len(new_summary))
+        # 摘要是主输出、记忆是附加区：拆不出摘要正文时保留旧摘要，记忆照入
+        new_summary, memory_items = _split_summary_memories(raw)
+        if new_summary:
+            self.store.update_summary(session.id, new_summary)
+        else:
+            logger.warning("压缩输出缺摘要正文，保留旧摘要（会话 %s）", session.code)
+        for category, content in memory_items:
+            try:
+                self.store.add_memory(session.chat_id, category, content)
+            except sqlite3.Error as exc:
+                logger.warning("长期记忆入库失败（跳过该条）：%s", exc)
+        logger.info("会话 %s 摘要已压缩更新（%d 条旧消息 → %d 字符，提炼记忆 %d 条）",
+                    session.code, len(old), len(new_summary), len(memory_items))
         return True
 
     # ------------------------------------------------------------------

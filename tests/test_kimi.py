@@ -365,11 +365,12 @@ def test_to_anthropic_payload_system_merge_and_vision():
             ]},
         ],
         "response_format": {"type": "json_object"},   # OpenAI 系参数应被丢弃
-        "extra_body": {"reasoning_effort": "low"},
+        "reasoning_effort": "high",
     })
     assert payload["system"].startswith("人设一\n\n人设二\n\n")
     assert payload["max_tokens"] == 8192  # 缺省必填
     assert "response_format" not in payload and "extra_body" not in payload
+    assert payload["reasoning_effort"] == "high"
     assert "exactly one valid JSON object" in payload["system"]
     # 三条连续 user 合并成一条（交替规则），内容为 text blocks + image block
     assert [m["role"] for m in payload["messages"]] == ["user"]
@@ -529,11 +530,19 @@ def test_nonstream_bad_json_retries_as_empty_response(monkeypatch):
 
 
 def test_max_tokens_stripped_for_openai_but_kept_for_anthropic(monkeypatch):
-    """OpenAI 兼容网关剥离显式 max_tokens（封顶副作用），anthropic 保留（协议必填）。"""
+    """只给有封顶副作用的 free-tokens 剥离；其它协议/Provider 保留尺寸预算。"""
     ft = FakeOpenAI([fake_message("ok")])
     client = KimiClient(make_settings(max_retries=0), clients={"free-tokens": ft})
     assert client.chat(MSGS, max_tokens=32768) == "ok"
     assert "max_tokens" not in ft.completions.calls[0]
+
+    moonshot = FakeOpenAI([fake_message("ok-moonshot")])
+    settings = make_settings(max_retries=0)
+    settings.providers["moonshot"].api_key = "sk-moonshot"
+    settings.routing_heavy = [ModelCandidate("moonshot", "kimi-k2.5")]
+    client_moonshot = KimiClient(settings, clients={"moonshot": moonshot})
+    assert client_moonshot.chat(MSGS, max_tokens=24576) == "ok-moonshot"
+    assert moonshot.completions.calls[0]["max_tokens"] == 24576
 
     seen = {}
 
@@ -543,8 +552,13 @@ def test_max_tokens_stripped_for_openai_but_kept_for_anthropic(monkeypatch):
 
     monkeypatch.setattr(httpx, "post", fake_post)
     client2 = KimiClient(make_anthropic_settings())
-    assert client2.chat([{"role": "user", "content": "hi"}], max_tokens=32768) == "ok2"
+    assert client2.chat(
+        [{"role": "user", "content": "hi"}],
+        max_tokens=32768,
+        reasoning_effort="high",
+    ) == "ok2"
     assert seen["payload"]["max_tokens"] == 32768
+    assert seen["payload"]["reasoning_effort"] == "high"
 
 
 # ---- 前缀缓存：哨兵切分与剥离 ----

@@ -15,12 +15,17 @@ from feishu_assistant.modules.inbox import (
     IDEA_TABLE,
     MEMO_TABLE,
     InboxService,
+    archive_content,
+    explicit_tags,
+    explicit_archive_kind,
     extract_url,
     fallback_classification,
+    has_explicit_archive_intent,
     normalize_classification,
     should_handle,
 )
 from feishu_assistant.modules.paper import MessageContext
+from feishu_assistant.store import PaperStore, SessionStore
 
 CTX = MessageContext(chat_id="c1", open_id="ou_x", message_id="m1")
 NOW = time.mktime(datetime.date(2026, 7, 30).timetuple())
@@ -59,8 +64,10 @@ class FakeIO:
         return [r.fields for r in self.records.get(table, [])]
 
 
-def make_service(kimi=None, io=None):
-    return InboxService(Settings(), kimi or FakeKimi(), io=io if io is not None else FakeIO())
+def make_service(kimi=None, io=None, **kwargs):
+    return InboxService(
+        Settings(), kimi or FakeKimi(), io=io if io is not None else FakeIO(), **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -262,3 +269,133 @@ def test_real_inbox_template_complete():
     assert "{{TEXT}}" in tpl and "{{TODAY}}" in tpl
     for marker in ("收藏", "灵感", "备忘", "deadline", "tags"):
         assert marker in tpl
+
+
+# ---- 归档意图扩展 + 引导兜底（血泪回归：「个人随笔写进灵感库」曾被漏判成追问）----
+
+
+def test_should_handle_archive_intent_natural_phrasing():
+    assert should_handle("个人随笔：大模型规则幻觉的思考……写进灵感库，标签幻觉")
+    assert should_handle("把这段话记录进灵感")
+    assert should_handle("把这个链接存到收藏库")
+    assert should_handle("收录到备忘库：明天交表")
+    assert not should_handle("灵感库怎么用")
+    assert not should_handle("今天天气怎么样")
+
+
+def test_explicit_archive_kind_is_deterministic():
+    assert explicit_archive_kind("写进灵感库：正文") == "灵感"
+    assert explicit_archive_kind("把链接存到收藏库") == "收藏"
+    assert explicit_archive_kind("提醒我明天交表") == "备忘"
+    assert explicit_archive_kind("把这段话记录进灵感") == "灵感"
+    assert has_explicit_archive_intent("个人随笔写进灵感库")
+    assert not has_explicit_archive_intent("灵感库怎么用")
+
+
+def test_archive_guidance_gives_deterministic_hint_without_model(tmp_path=None):
+    from feishu_assistant.modules.inbox import archive_guidance
+    hint = archive_guidance("把我的思考收录一下，灵感库那种")
+    assert hint and "写进灵感库" in hint and "记一下" in hint
+    # 纯提问不引导（交给正常问答路径）
+    assert archive_guidance("灵感库里有几条记录？") is None
+    assert archive_guidance("灵感库怎么用") is None
+    assert archive_guidance("今天聊点啥") is None
+
+
+def test_try_handle_guidance_does_not_call_model_or_save():
+    from feishu_assistant.modules.inbox import InboxService
+    kimi = FakeKimi('{"type": "灵感", "title": "", "summary": "", "tags": ["幻觉"], "direction": "大模型开发", "raw": "x", "url": "", "deadline_ms": null, "note": ""}')
+    io = FakeIO()
+    svc = InboxService(Settings(), kimi, io=io)
+    reply = svc.try_handle("帮我把随笔同步到灵感库", CTX)
+    assert reply and "写进灵感库" in reply
+    assert kimi.calls == []  # 引导是确定性的，不调模型
+    assert io.records == {}  # 不写库
+
+
+def test_archive_intent_reaches_real_save_not_hallucination():
+    from feishu_assistant.modules.inbox import InboxService
+    kimi = FakeKimi('{"type": "灵感", "title": "", "summary": "", "tags": ["大模型规则幻觉"], "direction": "大模型开发", "raw": "随笔正文", "url": "", "deadline_ms": null, "note": ""}')
+    io = FakeIO()
+    svc = InboxService(Settings(), kimi, io=io)
+    reply = svc.try_handle("个人随笔：大模型对规则的理解……写进灵感库，标签大模型规则幻觉", CTX)
+    assert "已记灵感" in reply
+    rows = io.records.get(IDEA_TABLE, [])
+    assert len(rows) == 1 and "个人随笔" in rows[0].fields["内容"]
+    assert rows[0].fields["标签"] == ["大模型规则幻觉"]
+
+
+def test_explicit_target_overrides_model_misclassification():
+    """目标库属于用户指令，不允许分类模型把「灵感库」改判成备忘库。"""
+    kimi = FakeKimi('{"type": "备忘", "title": "", "summary": "", "tags": [], "direction": "大模型开发", "deadline": ""}')
+    io = FakeIO()
+    svc = InboxService(Settings(), kimi, io=io)
+    reply = svc.try_handle("个人随笔：约束满足与规则幻觉，写进灵感库", CTX)
+    assert "已记灵感" in reply
+    assert len(io.fields_of(IDEA_TABLE)) == 1
+    assert io.fields_of(MEMO_TABLE) == []
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("写进灵感库：真正的正文", "真正的正文"),
+    ("真正的正文，把这段话记录进灵感", "真正的正文"),
+    ("个人随笔：规则理解与遵守脱节。写进灵感库，标签规则幻觉", "个人随笔：规则理解与遵守脱节。"),
+    ("灵感：真正的正文", "真正的正文"),
+])
+def test_archive_content_strips_instruction_not_body(text, expected):
+    assert archive_content(text) == expected
+
+
+def test_archive_content_resolves_deictic_command_to_previous_message():
+    assert archive_content("把这段话记录进灵感", "上一条真正正文") == "上一条真正正文"
+    assert explicit_tags("正文，写进灵感库，标签规则幻觉、约束满足") == ["规则幻觉", "约束满足"]
+
+
+def test_idea_uses_previous_text_and_associates_bound_paper(tmp_path):
+    kimi = FakeKimi('{"type":"灵感","tags":["自动标签"],"direction":"大模型开发"}')
+    io = FakeIO()
+    session_store = SessionStore(tmp_path / "sessions.db")
+    paper_store = PaperStore(tmp_path / "papers.db")
+    session = session_store.create_session(
+        "c1", "《AutoHarness》精读", bind_type="paper", bind_ref="2603.03329"
+    )
+    session_store.set_active_session("c1", session.id)
+    session_store.add_message(session.id, "c1", "user", "语言模型遵守规则需要外部约束。")
+    paper_store.save_paper(
+        "c1", "2603.03329", "AutoHarness", "正文", doc_url="https://feishu.cn/docx/paper"
+    )
+    svc = make_service(
+        kimi, io, session_store=session_store, paper_store=paper_store
+    )
+
+    reply = svc.try_handle("把这段话记录进灵感，标签规则幻觉", CTX)
+    row = io.fields_of(IDEA_TABLE)[0]
+    assert row["内容"] == "语言模型遵守规则需要外部约束。"
+    assert "记录进灵感" not in row["内容"]
+    assert row["标签"][:2] == ["规则幻觉", "自动标签"]
+    assert row["关联论文"] == "AutoHarness"
+    assert row["论文ID"] == "2603.03329"
+    assert row["论文链接"] == {
+        "text": "AutoHarness", "link": "https://feishu.cn/docx/paper"
+    }
+    assert "关联论文：《AutoHarness》" in reply
+
+
+def test_idea_same_message_stores_clean_body_with_bound_paper(tmp_path):
+    kimi = FakeKimi('{"type":"灵感","tags":[],"direction":"大模型开发"}')
+    io = FakeIO()
+    session_store = SessionStore(tmp_path / "sessions.db")
+    paper_store = PaperStore(tmp_path / "papers.db")
+    session = session_store.create_session(
+        "c1", "《AutoHarness》精读", bind_type="paper", bind_ref="2603.03329"
+    )
+    session_store.set_active_session("c1", session.id)
+    paper_store.save_paper("c1", "2603.03329", "AutoHarness", "正文")
+    svc = make_service(
+        kimi, io, session_store=session_store, paper_store=paper_store
+    )
+
+    svc.try_handle("规则理解和实际遵守存在脱节，把这段话记录进灵感", CTX)
+    row = io.fields_of(IDEA_TABLE)[0]
+    assert row["内容"] == "规则理解和实际遵守存在脱节"
+    assert row["关联论文"] == "AutoHarness"

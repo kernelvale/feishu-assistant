@@ -764,6 +764,37 @@ class FeishuBot:
             return False
         return True
 
+    def status_card_append(self, card_id: str, content: str) -> str:
+        """向流式卡追加一个 markdown 元素（完成后追加结果区）。
+        返回 "" 成功，否则错误码字符串。元素 id 自动分配（append-result-{seq}）。"""
+        import uuid as _uuid
+        from lark_oapi.api.cardkit.v1 import (
+            CreateCardElementRequest, CreateCardElementRequestBody,
+        )
+
+        seqs, lock = self._card_seq_state()
+        with lock:
+            seqs[card_id] = seqs.get(card_id, 0) + 1
+            seq = seqs[card_id]
+        element = {"tag": "markdown", "element_id": f"append_result_{seq}",
+                   "content": content}
+        body = (CreateCardElementRequestBody.builder()
+                .type("append").uuid(str(_uuid.uuid4())).sequence(seq)
+                .elements(json.dumps([element], ensure_ascii=False)).build())
+        req = (CreateCardElementRequest.builder()
+               .card_id(card_id).request_body(body).build())
+        try:
+            resp = self.client.cardkit.v1.card_element.create(req)
+        except Exception:
+            logger.exception("追加卡片元素传输失败")
+            return "exception"
+        if not resp.success():
+            logger.warning(
+                "追加卡片元素失败：code=%s, msg=%s, log_id=%s",
+                resp.code, resp.msg, resp.get_log_id())
+            return str(resp.code)
+        return ""
+
     def status_card_close(self, handle: str) -> None:
         """状态卡句柄终结：清理按 card_id 累积的流式序号（status.stop 调用，防只增不清的泄漏）。"""
         card_id, _, _ = handle.partition("|")
@@ -772,6 +803,22 @@ class FeishuBot:
         seqs, lock = self._card_seq_state()
         with lock:
             seqs.pop(card_id, None)
+
+    def status_card_current_seq(self, card_id: str) -> int:
+        """读取某卡当前流式序号（任务卡接管时持久化用）。"""
+        card_id = card_id.partition("|")[0]
+        seqs, lock = self._card_seq_state()
+        with lock:
+            return int(seqs.get(card_id, 0))
+
+    def status_card_seed_seq(self, card_id: str, seq: int) -> None:
+        """接管旧卡时回填流式序号基线（继续单调递增，不与历史帧撞号）。"""
+        card_id = card_id.partition("|")[0]
+        if not card_id:
+            return
+        seqs, lock = self._card_seq_state()
+        with lock:
+            seqs[card_id] = max(int(seq), seqs.get(card_id, 0))
 
     def send_text_id(self, chat_id: str, text: str) -> str:
         """发文本并返回 message_id（状态条后续 PATCH 用）；失败返回 ""。"""
